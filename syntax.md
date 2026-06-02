@@ -109,24 +109,16 @@ and then a `positionUpdate`. Use it before depending on final position or before
 starting a new high-level workflow phase.
 
 For `homedStatusUpdate`, observed homed axes report `-1`. Axes reset to `0`
-when tool preparation or homing state is cleared. The GUI updates homing state
-only from these asynchronous controller messages; it does not poll.
+when tool preparation or homing state is cleared.
 
 For `toolUpdate`, the controller reports the detected connected dispenser/tool.
-The GUI tracks this asynchronously and displays it in the status bar. Probing is
-allowed only when the reported type is `Probe`; otherwise the user is warned
-that the probe should be installed first.
+Observed values include `Probe` and `Dispenser`. Probing should be attempted
+only when the reported type is `Probe`.
 
-Practical GUI safety policy:
-
-- Manual free-motion commands are disabled until `homedStatusUpdate` reports
-  `x:-1 y:-1 z:-1`.
-- Homing/tool-preparation actions such as `V5` and `V3 Z` remain available
-  because they are the observed path back to a fully homed state.
-- GUI-issued manual motions (`V1`, `V2`, `V4`, and extrusion through `V1 E...`)
-  are immediately followed by `M400`.
-- While waiting for that synchronization response, the GUI blocks further
-  non-emergency commands. `M18` remains available as an urgent emergency stop.
+During `V3 Z` preparation, the firmware may emit multiple
+`Measure at switch: z-switch (z-min)` measurements. The last such measurement
+seen before `Preparing tool -- completed ...` is the observed tool offset for
+the current tool.
 
 Important caveat: one dispenser calibration log shows `V3 Z` emitting `error:`
 messages and still returning `ok`. A robust sender must scan all responses
@@ -146,12 +138,49 @@ Observed coordinate conventions:
 - Dispensing and probing near the substrate use negative Z coordinates.
 - The `D` flag enables compensation/offset behavior for Z and XYZ moves.
 - With `V102 Z0.1`, reported final Z for `D` moves is commonly about
-  `+0.1 mm` above the commanded compensated Z. This strongly suggests
-  `V102 Z...` configures dispenser standoff or a dispense Z offset.
+  `+0.1 mm` above the commanded compensated Z. This indicates `V102 Z...`
+  configures the dispenser hover height during a write/dispense operation.
 
 The observed dot routine has sub-0.02 mm diagonal XY motion. That is likely
 below practical machine resolution and can be ignored for a simplified dot
 implementation. The extrusion/plunger pulse is the important part.
+
+## User Stage Region and Height-Map Probing
+
+The top `40 mm` of the stage is treated as calibration area. User work regions
+must stay inside:
+
+```text
+X: 0..128 mm
+Y: 40..157 mm
+```
+
+For height-map detection, probe an evenly spaced grid or explicit point list
+inside the user region. The stored height-map value is the probed
+`probeMeasurement z` value at each point. No extra software correction between
+probe and dispenser offsets is required if the controller's built-in tool offset
+compensation is active.
+
+Observed/inferred height-map sequence:
+
+```text
+V201 E1
+V1 X<x0> Y<y0>
+M400
+V4 R1 Iheightmap_1
+V4 R0.1 Iheightmap_1
+V1 X<x1> Y<y1>
+M400
+V4 R0.1 Iheightmap_2
+...
+V201 E0
+V3 Z
+M400
+```
+
+Use `V4 R1` only for first-point coarse positioning. Keep the first point only
+after the following `V4 R0.1`; all remaining height-map points use `V4 R0.1`
+directly.
 
 ## Command Table
 
@@ -169,7 +198,7 @@ The meanings below are based on observed logs only.
 | `V4` | `V4 [R<clearance>] [I<id>]` | Probe current XY and report `probeMeasurement`. `R` is best interpreted as post-probe retract/clearance. |
 | `V5` | `V5` | Home/reset X and Y only. Resets tool preparations, homes Y then X. Does not perform full Z/tool calibration. |
 | `V101` | `V101 D1` | Select dispenser tool in observed logs. Do not use this to select the probe; the controller reports detected hardware via `toolUpdate`. |
-| `V102` | `V102 [Z<offset>]` | Set or clear dispenser Z/standoff offset. `V102 Z0.1` sets offset; bare `V102` clears/ends that mode. |
+| `V102` | `V102 [Z<height>]` | Set or clear dispenser hover height for write/dispense moves. `V102 Z0.1` sets hover height; bare `V102` clears/ends that mode. |
 | `V201` | `V201 E0` or `V201 E1` | Disable/enable probe height safety. |
 
 ## Command Details
@@ -413,9 +442,10 @@ V3 Z
 
 The dispenser logs prove `V101 D1` selects the dispenser. Do not use `V101` as a
 probe-selection command. The hardware reports the detected connected tool via
-`toolUpdate`; the GUI allows probing only when that reported type is `Probe`.
+`toolUpdate`; probing should be attempted only when that reported type is
+`Probe`.
 
-### `V102` - Dispenser Offset / Standoff
+### `V102` - Dispenser Hover Height
 
 Observed:
 
@@ -430,9 +460,9 @@ sent after the dispense/calibration path and before retract/park.
 
 Current interpretation:
 
-- `V102 Z<offset>` sets the dispenser standoff/height offset used by later
-  `D` compensated moves.
-- Bare `V102` clears or finalizes that dispenser offset mode.
+- `V102 Z<height>` sets the dispenser hover height used by later write/dispense
+  moves, especially `D` compensated moves.
+- Bare `V102` clears or finalizes that hover-height mode.
 
 ### `V201` - Probe Height Safety
 
@@ -569,7 +599,7 @@ Purpose:
 - Explicitly home XY.
 - Select dispenser.
 - Prepare dispenser tool and calibrate Z/top travel.
-- Set dispenser standoff/offset before drawing calibration features.
+- Set dispenser hover height before drawing calibration features.
 
 If `V3 Z` fails, the proprietary software falls back to explicit homing and
 tool selection. Error lines must be handled.
@@ -644,7 +674,7 @@ M400
 
 Motion intent:
 
-1. Prepare dispenser and set standoff with `V102 Z0.1`.
+1. Prepare dispenser and set hover height with `V102 Z0.1`.
 2. Move to the dot location.
 3. Approach to hover height.
 4. Move down near substrate.
@@ -674,8 +704,7 @@ M141 T240 D300
 M400
 ```
 
-The control GUI always sends `M141` with a `D` duration field, capped at
-`3600` seconds.
+`M141` requires a `D` duration field. The observed maximum is `3600` seconds.
 
 Stop heating:
 
@@ -703,7 +732,8 @@ are `M141` and `M142`.
 6. Use `V5` and `V101 D1` before dispenser operations if tool state is unknown.
 7. Use `V201 E1` only during probing workflows, and `V201 E0` before leaving
    probing.
-8. Use `V102 Z...` before dispenser `D` moves and bare `V102` afterward.
+8. Use `V102 Z...` to set dispenser hover height before write/dispense moves
+   and bare `V102` afterward.
 9. For dispensing, preserve the prime/retract `E` balance. Net `E` for dots may
    be near zero even though material is deposited.
 10. Do not send ordinary `G1`, `G28`, `M140`, or `M190` unless separately tested;
@@ -714,7 +744,7 @@ are `M141` and `M142`.
 - Exact semantics of `M141 D...` beyond "required duration/timeout-like field"
   are not proven.
 - Exact internal meaning of `D` is inferred as compensation/dispense-height mode.
-- Exact internal meaning of `V102` is inferred as dispenser standoff/offset mode.
+- Exact internal behavior of `V102` is inferred as dispenser hover-height mode.
 - The relationship between `R` in `V4 R...` and final Z can be affected by
   probe displacement, safety height, and current state.
 - Coordinate transforms after alignment are likely handled in software before
