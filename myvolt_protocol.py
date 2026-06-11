@@ -114,6 +114,11 @@ _TOOL_RE = re.compile(
     r"toolUpdate\s+type:(?P<tool_type>\S+)(?:\s+version:(?P<version>\d+))?"
 )
 
+_MAXIMUM_Z_RE = re.compile(
+    rf"setting maximum Z position to\s+(?P<z>{_FLOAT})",
+    re.IGNORECASE,
+)
+
 
 def parse_position(line: str) -> Position | None:
     match = _POSITION_RE.search(line)
@@ -175,6 +180,13 @@ def parse_tool_status(line: str) -> ToolStatus | None:
         tool_type=match.group("tool_type"),
         version=int(version) if version is not None else None,
     )
+
+
+def parse_maximum_z_position(line: str) -> float | None:
+    match = _MAXIMUM_Z_RE.search(line)
+    if match is None:
+        return None
+    return float(match.group("z"))
 
 
 def is_error_line(line: str) -> bool:

@@ -101,6 +101,7 @@ Common responses:
 - `bedTemperatureUpdate current:... target:... timeRemaining:...`: heater telemetry.
 - `homedStatusUpdate x:... y:... z:...`: homing state update.
 - `toolUpdate type:... version:...`: controller-detected connected dispenser/tool type.
+- `log: setting maximum Z position to ...`: current tool's maximum Z height.
 - `log:` or plain log text: firmware/software status.
 - `error:`: important. Treat as fatal even if a later `ok` appears.
 
@@ -118,7 +119,10 @@ only when the reported type is `Probe`.
 During `V3 Z` preparation, the firmware may emit multiple
 `Measure at switch: z-switch (z-min)` measurements. The last such measurement
 seen before `Preparing tool -- completed ...` is the observed tool offset for
-the current tool.
+the current tool. The same preparation normally emits
+`setting maximum Z position to ...`; use the last observed value as the maximum
+Z limit for that installed tool. Any explicit move toward this limit should
+target a smaller value; the GUI uses a `0.5 mm` margin.
 
 Important caveat: one dispenser calibration log shows `V3 Z` emitting `error:`
 messages and still returning `ok`. A robust sender must scan all responses
@@ -135,6 +139,8 @@ Observed coordinate conventions:
 - Positive Y moves toward the bottom.
 - Homing is hidden inside `V3 Z` or explicitly invoked with `V5`.
 - Z top/max position is around 9 to 11 mm depending on tool calibration.
+- The z-switch XY return position observed in logs is
+  `X4.820494 Y7.966725`.
 - Dispensing and probing near the substrate use negative Z coordinates.
 - The `D` flag enables compensation/offset behavior for Z and XYZ moves.
 - With `V102 Z0.1`, reported final Z for `D` moves is commonly about
@@ -174,13 +180,15 @@ M400
 V4 R0.1 Iheightmap_2
 ...
 V201 E0
-V3 Z
+V1 Z<maximum-z-minus-0.5>
+V1 X4.820494 Y7.966725
 M400
 ```
 
 Use `V4 R1` only for first-point coarse positioning. Keep the first point only
 after the following `V4 R0.1`; all remaining height-map points use `V4 R0.1`
-directly.
+directly. If no maximum Z has been reported yet, use `V3 Z` as the fallback
+final retract/return command.
 
 ## Command Table
 
@@ -330,7 +338,7 @@ V2 X0 Y0.05
 This moves relative to the current XY position. It was used during alignment
 and fine positioning.
 
-### `V3 Z` - Prepare Tool / Safe Z
+### `V3 Z` - Prepare Tool / Max-Z Retract
 
 For the probe tool, first use performs a full preparation:
 
@@ -350,7 +358,8 @@ For the dispenser tool, first use performs dispenser preparation:
 - Measures top Z and Z switch.
 - Sets maximum Z position.
 
-After the tool is already prepared, `V3 Z` usually acts as a safe/top-Z retract.
+After the tool is already prepared, `V3 Z` usually acts as a max/top-Z retract
+and return toward the z-switch position.
 
 Failure caveat:
 
@@ -645,6 +654,62 @@ V1 X0 Y0
 M400
 ```
 
+### Generic Printed Trace
+
+A printed trace uses `V102` to set the compensated hover/travel offset and
+`V1 ... D` moves whose explicit `Z` value is the height-map value at that XY
+position. Do not add the hover height to the commanded `Z`; doing so would
+double-apply the offset.
+
+Before building and sending a print path, prepare the installed tool and wait
+for synchronization. This normally emits `setting maximum Z position to ...`,
+which should be cached for the final retract/return.
+
+```text
+V3 Z
+M400
+```
+
+Before the first trace chunk, clear any existing hover offset and move XY
+directly from the prepared z-switch/max-Z state to the trace start. Omit `F` so
+the controller uses its direct/default speed.
+
+```text
+V102
+V1 X<start-x> Y<start-y>
+```
+
+For each trace chunk:
+
+```text
+V102 Z<travel-height>
+V1 Z<height-map-z-at-start> D F<speed>
+V1 X<start-x> Y<start-y> Z<height-map-z-at-start> D F<speed>
+V102 Z<print-height>
+V1 X<start-x> Y<start-y> Z<height-map-z-at-start> D F<speed>
+V1 E<kick>
+V1 X<next-x> Y<next-y> Z<height-map-z-at-next> D F<speed>
+...
+V1 E-<retract>
+V102
+V102 Z<travel-height>
+V1 Z<height-map-z-at-end> D F<speed>
+V102
+```
+
+Long paths can be split into chunks. Each chunk gets its own positive kick at
+the start and negative retract at the end. After the final chunk, clear `V102`,
+raise to a value strictly below the last observed maximum Z, move back to the
+z-switch XY position, then use `M400` to synchronize the queued print path. The
+GUI currently uses `maximum-z - 0.5 mm`.
+
+```text
+V102
+V1 Z<maximum-z-minus-0.5>
+V1 X4.820494 Y7.966725
+M400
+```
+
 ### Single Dot Dispense
 
 Observed in `dispense_dots.txt`:
@@ -727,16 +792,20 @@ are `M141` and `M142`.
 2. Wait for `ok`, but also scan all response lines for `error:`.
 3. Use `M400` as a barrier before reading final `positionUpdate`.
 4. Expect telemetry to arrive between command responses.
-5. Treat `V3 Z` as a stateful prepare/retract command whose behavior depends on
+5. Pace long command streams. Do not dump large print paths into the serial port
+   as a burst; wait for `ok` or an error before sending the next framed command.
+   Otherwise the controller can report line-length errors such as
+   `Missing characters detected`.
+6. Treat `V3 Z` as a stateful prepare/retract command whose behavior depends on
    active tool and preparation state.
-6. Use `V5` and `V101 D1` before dispenser operations if tool state is unknown.
-7. Use `V201 E1` only during probing workflows, and `V201 E0` before leaving
+7. Use `V5` and `V101 D1` before dispenser operations if tool state is unknown.
+8. Use `V201 E1` only during probing workflows, and `V201 E0` before leaving
    probing.
-8. Use `V102 Z...` to set dispenser hover height before write/dispense moves
+9. Use `V102 Z...` to set dispenser hover height before write/dispense moves
    and bare `V102` afterward.
-9. For dispensing, preserve the prime/retract `E` balance. Net `E` for dots may
+10. For dispensing, preserve the prime/retract `E` balance. Net `E` for dots may
    be near zero even though material is deposited.
-10. Do not send ordinary `G1`, `G28`, `M140`, or `M190` unless separately tested;
+11. Do not send ordinary `G1`, `G28`, `M140`, or `M190` unless separately tested;
     they were not observed in these captures.
 
 ## Unknowns / Open Items
