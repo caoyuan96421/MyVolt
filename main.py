@@ -1649,6 +1649,7 @@ class MainWindow(QMainWindow):
         self.height_map_active = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
+        self.height_map_abort_requested = False
         self.height_map_probe_phase: str | None = None
         self.pattern_points: list[tuple[float, float]] = []
         self.pattern_file_path: str | None = None
@@ -1960,17 +1961,30 @@ class MainWindow(QMainWindow):
         self.save_height_map_button = QPushButton("Save")
         self.load_height_map_button = QPushButton("Load")
         self.start_height_map_button = QPushButton("Start Probing")
-        button_layout = QHBoxLayout()
+        button_widget = QWidget()
+        button_layout = QVBoxLayout(button_widget)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(4)
         button_layout.addWidget(self.delete_height_map_button)
         button_layout.addWidget(self.save_height_map_button)
         button_layout.addWidget(self.load_height_map_button)
         button_layout.addWidget(self.start_height_map_button)
+        for button in (
+            self.delete_height_map_button,
+            self.save_height_map_button,
+            self.load_height_map_button,
+            self.start_height_map_button,
+        ):
+            button.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
 
         layout.addRow("Probe offset", self.probe_tool_offset_label)
         layout.addRow("Dispenser offset", self.dispenser_tool_offset_label)
         layout.addRow("Probe points", point_count_layout)
         layout.addRow("Height map", self.height_map_status_label)
-        layout.addRow("", button_layout)
+        layout.addRow(button_widget)
         self.homed_motion_widgets.append(self.start_height_map_button)
         return group
 
@@ -2896,6 +2910,7 @@ class MainWindow(QMainWindow):
         self.height_map_active = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
+        self.height_map_abort_requested = False
         self.height_map_probe_phase = None
         if hasattr(self, "stage_view"):
             self.stage_view.set_height_map_points([])
@@ -3547,8 +3562,22 @@ class MainWindow(QMainWindow):
             bool(self.height_map_points) and height_map_idle
         )
         self.load_height_map_button.setEnabled(can_issue and height_map_idle)
+        if self.height_map_active:
+            if self.height_map_abort_requested:
+                self.start_height_map_button.setText("Aborting...")
+            elif self.height_map_finishing:
+                self.start_height_map_button.setText("Finishing...")
+            else:
+                self.start_height_map_button.setText("Abort")
+        else:
+            self.start_height_map_button.setText("Start Probing")
         self.start_height_map_button.setEnabled(
-            homed_motion_allowed and not self.height_map_active
+            (
+                self.height_map_active
+                and not self.height_map_finishing
+                and not self.height_map_abort_requested
+            )
+            or (homed_motion_allowed and not self.height_map_active)
         )
         if hasattr(self, "printing_widgets"):
             for widget in self.printing_widgets:
@@ -4663,6 +4692,7 @@ class MainWindow(QMainWindow):
         self.height_map_active = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
+        self.height_map_abort_requested = False
         self.height_map_probe_phase = None
         if work_area is not None:
             self.stage_view.set_work_area(*work_area)
@@ -4748,6 +4778,9 @@ class MainWindow(QMainWindow):
         self.stage_view.set_height_map_preview_points(self.build_height_map_plan())
 
     def start_height_map_probing(self) -> None:
+        if self.height_map_active:
+            self.request_height_map_abort()
+            return
         if self.serial_thread is None:
             self.append_log("! not connected")
             return
@@ -4770,6 +4803,7 @@ class MainWindow(QMainWindow):
         self.height_map_active = True
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
+        self.height_map_abort_requested = False
         self.height_map_probe_phase = None
         self.motion_busy = True
         self.stage_view.set_height_map_points([])
@@ -4802,6 +4836,10 @@ class MainWindow(QMainWindow):
         if not self.height_map_active:
             return
 
+        if self.height_map_abort_requested:
+            self.finish_height_map_sequence()
+            return
+
         if self.height_map_index >= len(self.height_map_plan):
             self.finish_height_map_sequence()
             return
@@ -4831,6 +4869,9 @@ class MainWindow(QMainWindow):
                 "# height map coarse point 1: "
                 f"X{probe.x:.4f} Y{probe.y:.4f} Z{probe.z:.6f}"
             )
+            if self.height_map_abort_requested:
+                self.finish_height_map_sequence()
+                return
             self.height_map_probe_phase = "fine"
             self.height_map_status_label.setText(
                 f"Fine {self.height_map_index}/{len(self.height_map_plan)}"
@@ -4854,25 +4895,36 @@ class MainWindow(QMainWindow):
         self.queue_next_height_map_point()
 
     def finish_height_map_sequence(self) -> None:
+        if self.height_map_finishing:
+            return
         self.height_map_waiting_for_probe = False
         self.height_map_probe_phase = None
         self.height_map_finishing = True
+        status = "Aborting" if self.height_map_abort_requested else "Finishing"
         self.height_map_status_label.setText(
-            f"Finishing {len(self.height_map_points)}/{len(self.height_map_plan)}"
+            f"{status} {len(self.height_map_points)}/{len(self.height_map_plan)}"
         )
         self.send_payload("V201 E0", force=True)
         for payload in self.return_to_z_switch_commands():
             self.send_payload(payload, force=True)
         self.send_payload("M400", force=True)
+        self.update_control_states()
 
     def finish_height_map(self) -> None:
+        aborted = self.height_map_abort_requested
         self.height_map_active = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
+        self.height_map_abort_requested = False
         self.height_map_probe_phase = None
         self.motion_busy = False
-        self.height_map_status_label.setText(self.height_map_summary())
-        self.append_log(f"# height map completed: {self.height_map_summary()}")
+        if aborted:
+            status = self.aborted_height_map_summary()
+            self.height_map_status_label.setText(status)
+            self.append_log(f"# height map aborted: {status}")
+        else:
+            self.height_map_status_label.setText(self.height_map_summary())
+            self.append_log(f"# height map completed: {self.height_map_summary()}")
         self.update_control_states()
 
     def height_map_summary(self) -> str:
@@ -4884,12 +4936,34 @@ class MainWindow(QMainWindow):
             f"Z {min(heights):.4f}..{max(heights):.4f}"
         )
 
+    def aborted_height_map_summary(self) -> str:
+        if not self.height_map_points:
+            return "Height map aborted: no points"
+        return (
+            "Height map aborted: "
+            f"{len(self.height_map_points)}/{len(self.height_map_plan)} points"
+        )
+
+    def request_height_map_abort(self) -> None:
+        if not self.height_map_active or self.height_map_finishing:
+            return
+        self.height_map_abort_requested = True
+        self.height_map_status_label.setText(
+            f"Aborting after current probe "
+            f"{self.height_map_index}/{len(self.height_map_plan)}"
+        )
+        self.append_log("# height map abort requested")
+        if not self.height_map_waiting_for_probe:
+            self.finish_height_map_sequence()
+        self.update_control_states()
+
     def cancel_height_map(self, status: str) -> None:
         if not self.height_map_active and not self.height_map_finishing:
             return
         self.height_map_active = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
+        self.height_map_abort_requested = False
         self.height_map_probe_phase = None
         self.height_map_status_label.setText(status)
 

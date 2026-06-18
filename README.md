@@ -125,6 +125,10 @@ an evenly spaced grid over the rectangle:
 Planned probe locations are shown before probing as small hollow dots. Collected
 points are displayed live as colored dots inside the work rectangle.
 
+While probing, Start Probing changes to Abort. Abort finishes the current
+in-flight probe, keeps any points already measured, then runs the normal probe
+cleanup and max-Z/z-switch return sequence.
+
 The stage view shows a matching height colorbar to the right of the stage, using
 the current collected min/max Z range.
 
