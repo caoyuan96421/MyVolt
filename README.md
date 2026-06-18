@@ -46,18 +46,25 @@ for motion synchronization. `M18` remains available as Emergency Stop.
 
 - The Hardware panel connects/disconnects the selected COM port, refreshes the
   port list, homes XY with `V5`, prepares the installed tool with `V3 Z`, and
-  provides Emergency Stop with `M18`.
+  provides Emergency Stop with `M18`. The selected COM port is stored in
+  `conn.json` and restored on startup when available.
 - The compact Stage Control panel jogs X/Y with `V2`, jogs Z and extrusion with
   `V1`, and probes the current location with `V4 R1` or `V4 R0.1`.
 - The Temperature panel sits below Stage Control and sets heater temperature
   using `M141 T... D...`; duration is capped at `3600 s`.
 - Stop heating with `M142`.
-- Alignment, Leveling, and Printing sit on the right side of the stage view.
-- The Alignment panel shows two UVC webcam previews with independent camera
-  selectors and a shared exposure-compensation slider. Selections and exposure
-  are stored in `camera.json` and restored on startup when those cameras are
-  available. Exposure control is enabled only for active cameras that report Qt
-  `ExposureCompensation` support.
+- The left column contains Hardware, Stage Control, Temperature, and Raw Log.
+  The center column contains Stage View, Alignment, and Raw Payload. Pattern,
+  Leveling, and Printing sit on the right side of the stage view.
+- The Alignment panel shows two side-by-side UVC webcam previews with
+  independent camera selectors and a shared exposure-compensation slider.
+  Selections, view rotations, and exposure are stored in `camera.json` and
+  restored on startup when those cameras are available. Exposure control is
+  enabled only for active cameras that report Qt `ExposureCompensation` support.
+  Scroll over a camera preview to zoom that view.
+- The Pattern panel loads point patterns, overlays transformed dots on the stage
+  view, assists two-point camera alignment, and prints each pattern point as a
+  paste dot. `dummy_pattern.csv` is included as a simple 20 x 20 mm test pattern.
 - Print a height-map-compensated circle from the Printing panel.
 - Send unframed raw payloads; the app frames them as `N... *crc,length`.
 
@@ -102,10 +109,10 @@ The stage view marks:
 The Leveling panel controls height-map probing. The work area is an editable
 rectangle in the stage view, not a numeric form. It defaults to a `50 x 50 mm`
 square centered in the user stage region and cannot extend into the top
-calibration area.
+calibration area. The work area and X/Y probe counts persist in `leveling.json`.
 
-Drag inside the rectangle to move it. Drag an edge or corner to resize it. A
-plain click still moves the tool if motion is enabled.
+Drag an edge or corner to resize the rectangle. Dragging inside the rectangle is
+disabled; a plain click inside it still moves the tool if motion is enabled.
 
 Choose X/Y probe counts in the Leveling panel and start probing. The GUI probes
 an evenly spaced grid over the rectangle:
@@ -115,7 +122,9 @@ an evenly spaced grid over the rectangle:
 - Remaining points: `V4 R0.1` only.
 - Height-map values are stored from returned `probeMeasurement z`.
 
-Collected points are displayed live as colored dots inside the work rectangle.
+Planned probe locations are shown before probing as small hollow dots. Collected
+points are displayed live as colored dots inside the work rectangle.
+
 The stage view shows a matching height colorbar to the right of the stage, using
 the current collected min/max Z range.
 
@@ -157,3 +166,47 @@ start from the prepared z-switch/max-Z state. After the print completes, it
 clears `V102`, raises to `reported maximum Z - 0.5 mm`, moves back to the
 z-switch XY position, synchronizes with `M400`, and hides the edited circle from
 the stage view.
+
+## Pattern Alignment
+
+A pattern is a list of PCS `x,y` points. CSV files should contain either a
+header row followed by `x,y` values or raw comma-separated `x,y` rows. The app
+also accepts JSON lists or objects with a `points` list.
+
+Loaded pattern dots are transformed into stage WCS by flipping both PCS axes,
+scaling, rotating by the current angle, then applying the displayed work offset.
+Loading a pattern initializes the offset to the bottom-left of the visible stage
+view with zero rotation and `1.0` scale.
+
+Click & Align opens an Alignment Procedure dialog for the two-point workflow:
+select a pattern dot, move the machine to the matching physical point with Z
+raised, lower to the adjustable Align Z height in the dialog, fine-align using
+the cameras, and confirm. The second point repeats the process and updates work
+offset, rotation, and scale. While selecting a pattern dot, the hovered point is
+highlighted and the selected point keeps a colored perimeter.
+
+Align to Anchors uses the same dialog, but the two PCS anchor coordinates are
+entered directly with X/Y spin boxes instead of selecting dots on the stage view.
+The dialog shows the current workflow step and includes XY jog buttons wired to
+coarse and fine XY step settings. Coarse defaults to `1 mm`; fine defaults to
+`0.05 mm`. Rough/go-to workflow steps use the coarse step; fine-align steps use
+the fine step. Typed anchor positions are stored in `anchors.json` and restored
+as the next dialog defaults. The dialog Align Z and XY step settings are stored
+in the same file. If the measured two-point scale differs from nominal by more than
+`2%`, the app shows a warning.
+
+The pattern points used for alignment are shown on the stage as red crosses.
+After alignment completes, the leveling work area is automatically resized to the
+bounding box of the transformed dot pattern plus those alignment points, with a
+default `2 mm` margin. Completing or canceling an alignment queues a retract to
+`reported maximum Z - 0.5 mm`; if maximum Z is not known yet, the app falls back
+to `V3 Z`.
+
+Use Save Alignment and Load Alignment to store or restore the current pattern
+transform as JSON. Alignment files contain the work offset, rotation, and scale.
+
+Pattern dot printing uses the Pattern panel print height, kick, retract, and
+travel height settings. It requires a height map and uses the same height-map Z
+interpolation as circle printing. During dot printing, the current dot is yellow
+and completed dots are green. Starting a new pattern print resets all dots to the
+unprinted color first.
