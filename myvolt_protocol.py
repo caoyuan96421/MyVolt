@@ -190,4 +190,5 @@ def parse_maximum_z_position(line: str) -> float | None:
 
 
 def is_error_line(line: str) -> bool:
-    return line.lstrip("~ ").lower().startswith("error:")
+    text = line.lstrip("~ ").lower()
+    return text.startswith("error:") or "missing characters detected" in text

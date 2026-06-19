@@ -665,6 +665,8 @@ class SerialThread(QThread):
 
     def _emit_received(self, line: str) -> None:
         self._update_command_ack_state(line)
+        if is_error_line(line):
+            self.clear_pending()
         self.received_line.emit(line)
         if is_error_line(line):
             self.error_line.emit(line)
@@ -2350,7 +2352,7 @@ class MainWindow(QMainWindow):
         self.pattern_reset_button.clicked.connect(self.reset_pattern_alignment)
         self.pattern_save_alignment_button.clicked.connect(self.save_pattern_alignment)
         self.pattern_load_alignment_button.clicked.connect(self.load_pattern_alignment)
-        self.pattern_print_button.clicked.connect(self.start_pattern_print)
+        self.pattern_print_button.clicked.connect(self.on_pattern_print_button_clicked)
         self.stage_view.pattern_point_selected.connect(self.on_pattern_point_selected)
         self.stage_view.work_area_changed.connect(
             lambda _x, _y, _width, _height: self.on_leveling_settings_changed()
@@ -3582,9 +3584,6 @@ class MainWindow(QMainWindow):
 
         action, point_index = event
         if action == "start":
-            for index, state in list(self.pattern_print_dot_states.items()):
-                if state == "printing":
-                    self.pattern_print_dot_states[index] = "printed"
             self.pattern_print_dot_states[point_index] = "printing"
         elif action == "finish":
             self.pattern_print_dot_states[point_index] = "printed"
@@ -3768,13 +3767,29 @@ class MainWindow(QMainWindow):
             self.pattern_anchor_align_button.setEnabled(
                 homed_motion_allowed and pattern_idle
             )
-            self.pattern_print_button.setEnabled(
-                can_issue
-                and has_pattern
-                and has_height_map
-                and not self.print_circle_editing
-                and self.pattern_alignment_state is None
-            )
+            if self.pattern_print_active:
+                self.pattern_print_button.setText("Abort")
+                self.pattern_print_button.setEnabled(True)
+                self.pattern_print_button.setToolTip(
+                    "Abort the active dot print and clear pending print commands."
+                )
+            else:
+                pattern_print_enabled = (
+                    can_issue
+                    and has_pattern
+                    and has_height_map
+                    and not self.print_circle_editing
+                    and self.pattern_alignment_state is None
+                )
+                self.pattern_print_button.setText("Print Dots")
+                self.pattern_print_button.setEnabled(pattern_print_enabled)
+                self.pattern_print_button.setToolTip(
+                    self.pattern_print_tooltip(
+                        connected=connected,
+                        has_pattern=has_pattern,
+                        has_height_map=has_height_map,
+                    )
+                )
             for widget in (
                 self.pattern_print_height_spin,
                 self.pattern_kick_spin,
@@ -3791,6 +3806,35 @@ class MainWindow(QMainWindow):
                 self.stage_view.set_work_area_edit_enabled(
                     not self.height_map_active and not self.printing_active
                 )
+
+    def pattern_print_tooltip(
+        self,
+        *,
+        connected: bool,
+        has_pattern: bool,
+        has_height_map: bool,
+    ) -> str:
+        reasons: list[str] = []
+        if not connected:
+            reasons.append("Connect to the controller.")
+        if self.motion_busy:
+            reasons.append("Wait for the current motion/M400 synchronization.")
+        if self.height_map_active:
+            reasons.append("Wait for height mapping to finish or abort it.")
+        if self.printing_active:
+            reasons.append("Wait for the active print to finish or abort it.")
+        if not has_pattern:
+            reasons.append("Load a pattern file.")
+        if not has_height_map:
+            reasons.append("Create or load a height map.")
+        if self.print_circle_editing:
+            reasons.append("Finish or cancel circle editing.")
+        if self.pattern_alignment_state is not None:
+            reasons.append("Finish or cancel the active alignment procedure.")
+
+        if not reasons:
+            return "Print pattern dots using the current alignment and height map."
+        return "Print Dots is disabled:\n- " + "\n- ".join(reasons)
 
     def warn_not_homed(self) -> None:
         QMessageBox.warning(
@@ -4546,6 +4590,22 @@ class MainWindow(QMainWindow):
         self.send_payload("M400", force=True)
         self.update_control_states()
 
+    def on_pattern_print_button_clicked(self) -> None:
+        if self.pattern_print_active:
+            self.abort_pattern_print()
+            return
+        self.start_pattern_print()
+
+    def abort_pattern_print(self) -> None:
+        if not self.pattern_print_active:
+            return
+        if self.serial_thread is not None:
+            self.serial_thread.clear_pending()
+        self.motion_busy = False
+        self.cancel_printing("Pattern print aborted")
+        self.append_log("# pattern print aborted; pending print commands cleared")
+        self.update_control_states()
+
     def queue_prepared_pattern_print(self) -> None:
         points = self.pending_pattern_print_points
         if points is None:
@@ -4594,7 +4654,7 @@ class MainWindow(QMainWindow):
             dot_count += 1
             z = self.interpolate_height(x, y)
             commands.append(f"V1 X{x:.6f} Y{y:.6f}")
-            events.append(("start", point_index))
+            events.append(None)
             commands.append(f"V102 Z{travel_height:g}")
             events.append(None)
             commands.append(f"V1 Z{z:.6f} D")
@@ -4602,7 +4662,7 @@ class MainWindow(QMainWindow):
             commands.append(f"V102 Z{print_height:g}")
             events.append(None)
             commands.append(f"V1 X{x:.6f} Y{y:.6f} Z{z:.6f} D")
-            events.append(None)
+            events.append(("start", point_index))
             if kick:
                 commands.append(f"V1 E{kick:g}")
                 events.append(None)
@@ -4610,13 +4670,13 @@ class MainWindow(QMainWindow):
                 commands.append(f"V1 E{-retract:g}")
                 events.append(None)
             commands.append("V102")
-            events.append(None)
+            events.append(("finish", point_index))
             commands.append(f"V102 Z{travel_height:g}")
             events.append(None)
             commands.append(f"V1 Z{z:.6f} D")
             events.append(None)
             commands.append("V102")
-            events.append(("finish", point_index))
+            events.append(None)
 
         if dot_count == 0:
             return [], []
@@ -4753,9 +4813,11 @@ class MainWindow(QMainWindow):
             self.pattern_print_active = False
         self.update_control_states()
 
-    def cancel_printing(self, status: str) -> None:
+    def cancel_printing(self, status: str, clear_queue: bool = False) -> None:
         if not self.printing_active and not self.print_circle_editing:
             return
+        if clear_queue and self.serial_thread is not None:
+            self.serial_thread.clear_pending()
         self.printing_active = False
         self.print_preparing = False
         self.pending_print_circle = None
@@ -4765,6 +4827,7 @@ class MainWindow(QMainWindow):
         self.clear_current_pattern_print_dot()
         self.stage_view.clear_print_circle()
         self.print_circle_button.setText("Print Circle")
+        self.pattern_print_button.setText("Print Dots")
         self.print_status_label.setText(status)
         if self.pattern_print_active:
             self.pattern_status_label.setText(status)
@@ -5230,7 +5293,6 @@ class MainWindow(QMainWindow):
 
     def on_sent_line(self, line: str) -> None:
         self.append_log(f"> {line}")
-        self.consume_pattern_print_event()
 
     def on_received_line(self, line: str) -> None:
         self.append_log(f"< {line}")
@@ -5238,6 +5300,9 @@ class MainWindow(QMainWindow):
         if maximum_z is not None:
             self.maximum_z_position = maximum_z
             self.append_log(f"# maximum Z position: {maximum_z:.6f} mm")
+
+        if line.strip() == "ok":
+            self.consume_pattern_print_event()
 
         self.update_motion_sync(line)
         self.update_tool_offset_from_line(line)
@@ -5301,7 +5366,7 @@ class MainWindow(QMainWindow):
     def on_error_line(self, line: str) -> None:
         self.motion_busy = False
         self.cancel_height_map("Height map failed")
-        self.cancel_printing("Print failed")
+        self.cancel_printing("Print failed", clear_queue=True)
         self.preparation_in_progress = False
         self.awaiting_z_switch_measurement = False
         self.pending_tool_offset = None
