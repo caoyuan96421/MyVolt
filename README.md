@@ -47,7 +47,9 @@ for motion synchronization. `M18` remains available as Emergency Stop.
 - The Hardware panel connects/disconnects the selected COM port, refreshes the
   port list, homes XY with `V5`, prepares the installed tool with `V3 Z`, and
   provides Emergency Stop with `M18`. The selected COM port is stored in
-  `conn.json` and restored on startup when available.
+  `conn.json` and restored on startup when available. Stay alive stores its
+  setting in the same file and sends an idle `M400` query every 60 seconds while
+  connected to avoid the controller's idle shutoff.
 - The compact Stage Control panel jogs X/Y with `V2`, jogs Z and extrusion with
   `V1`, and probes the current location with `V4 R1` or `V4 R0.1`.
 - The Temperature panel sits below Stage Control and sets heater temperature
@@ -179,8 +181,9 @@ also accepts JSON lists or objects with a `points` list.
 
 Loaded pattern dots are transformed into stage WCS by flipping both PCS axes,
 scaling, rotating by the current angle, then applying the displayed work offset.
-Loading a pattern initializes the offset to the bottom-left of the visible stage
-view with zero rotation and `1.0` scale.
+Loading a pattern does not change the current alignment transform or red-cross
+alignment points. At startup and after Reset, the transform uses the bottom-left
+of the visible stage view with zero rotation and `1.0` scale.
 
 Click & Align opens an Alignment Procedure dialog for the two-point workflow:
 select a pattern dot, move the machine to the matching physical point with Z
@@ -191,7 +194,8 @@ highlighted and the selected point keeps a colored perimeter.
 
 Align to Anchors uses the same dialog, but the two PCS anchor coordinates are
 entered directly with X/Y spin boxes instead of selecting dots on the stage view.
-The dialog shows the current workflow step and includes XY jog buttons wired to
+It can be run without a loaded pattern as long as the stage is enabled. The
+dialog shows the current workflow step and includes XY jog buttons wired to
 coarse and fine XY step settings. Coarse defaults to `1 mm`; fine defaults to
 `0.05 mm`. Rough/go-to workflow steps use the coarse step; fine-align steps use
 the fine step. Typed anchor positions are stored in `anchors.json` and restored
@@ -200,14 +204,18 @@ in the same file. If the measured two-point scale differs from nominal by more t
 `2%`, the app shows a warning.
 
 The pattern points used for alignment are shown on the stage as red crosses.
+The stage view also draws green PCS X/Y arrows using the current alignment
+transform, so the arrows include the active flips, offset, rotation, and scale.
 After alignment completes, the leveling work area is automatically resized to the
 bounding box of the transformed dot pattern plus those alignment points, with a
 default `2 mm` margin. Completing or canceling an alignment queues a retract to
 `reported maximum Z - 0.5 mm`; if maximum Z is not known yet, the app falls back
 to `V3 Z`.
 
-Use Save Alignment and Load Alignment to store or restore the current pattern
-transform as JSON. Alignment files contain the work offset, rotation, and scale.
+Use Save Alignment and Load Alignment to store or restore the current alignment
+as JSON. Alignment files contain the work offset, rotation, scale, and the PCS
+alignment points shown as red crosses. Saving and loading alignment does not
+require a pattern to be loaded and does not replace the loaded pattern.
 
 Pattern dot printing uses the Pattern panel print height, kick, retract, and
 travel height settings. It requires a height map and uses the same height-map Z

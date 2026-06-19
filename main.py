@@ -8,7 +8,7 @@ import re
 import sys
 import time
 
-from PySide6.QtCore import QLineF, QRectF, QSize, QSizeF, QThread, Qt, Signal
+from PySide6.QtCore import QLineF, QRectF, QSize, QSizeF, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -20,6 +20,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -99,9 +100,12 @@ HEIGHT_COLORBAR_LABEL_WIDTH_PX = 46.0
 STAGE_ZOOM_MIN = 1.0
 STAGE_ZOOM_MAX = 8.0
 STAGE_ZOOM_STEP = 1.2
+PCS_AXIS_LENGTH_MM = 10.0
 MIN_PRINT_CIRCLE_RADIUS_MM = 1.0
 CIRCLE_PRINT_SEGMENT_MM = 1.0
 SERIAL_COMMAND_INTERVAL_S = 0.01
+STAY_ALIVE_INTERVAL_MS = 60_000
+STAY_ALIVE_PAYLOAD = "M400"
 MAXIMUM_Z_RETURN_MARGIN_MM = 0.5
 CAMERA_CONFIG_PATH = Path("camera.json")
 ANCHOR_CONFIG_PATH = Path("anchors.json")
@@ -692,6 +696,11 @@ class StageView(QWidget):
         self._print_circle: tuple[float, float, float] | None = None
         self._pattern_points: list[tuple[int, float, float]] = []
         self._pattern_alignment_points: list[tuple[float, float]] = []
+        self._pcs_axis_points: tuple[
+            tuple[float, float],
+            tuple[float, float],
+            tuple[float, float],
+        ] | None = None
         self._pattern_select_enabled = False
         self._selected_pattern_index: int | None = None
         self._hovered_pattern_index: int | None = None
@@ -804,9 +813,21 @@ class StageView(QWidget):
         self._pattern_alignment_points = list(points)
         self.update()
 
+    def set_pcs_axis_points(
+        self,
+        points: tuple[
+            tuple[float, float],
+            tuple[float, float],
+            tuple[float, float],
+        ] | None,
+    ) -> None:
+        self._pcs_axis_points = points
+        self.update()
+
     def clear_pattern_points(self) -> None:
         self._pattern_points = []
         self._pattern_alignment_points = []
+        self._pcs_axis_points = None
         self._pattern_select_enabled = False
         self._selected_pattern_index = None
         self._hovered_pattern_index = None
@@ -1023,6 +1044,7 @@ class StageView(QWidget):
         self._draw_pattern_points(painter, bounds)
         self._draw_height_map_preview_points(painter, bounds)
         self._draw_height_map_points(painter, bounds)
+        self._draw_pcs_axes(painter, bounds)
         self._draw_pattern_alignment_points(painter, bounds)
         self._draw_print_circle(painter, bounds)
         self._draw_probe_regions(painter, bounds)
@@ -1233,6 +1255,60 @@ class StageView(QWidget):
             painter.drawLine(QLineF(px - size, py - size, px + size, py + size))
             painter.drawLine(QLineF(px - size, py + size, px + size, py - size))
 
+    def _draw_pcs_axes(self, painter: QPainter, bounds: QRectF) -> None:
+        if self._pcs_axis_points is None:
+            return
+
+        origin, x_axis, y_axis = self._pcs_axis_points
+        if not all(
+            math.isfinite(value)
+            for point in (origin, x_axis, y_axis)
+            for value in point
+        ):
+            return
+
+        origin_px = self._map_stage_point_unclamped(*origin, bounds)
+        x_px = self._map_stage_point_unclamped(*x_axis, bounds)
+        y_px = self._map_stage_point_unclamped(*y_axis, bounds)
+        color = QColor("#0b8f3a")
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        painter.setPen(QPen(color, 2.4))
+        self._draw_arrow(painter, origin_px, x_px)
+        self._draw_arrow(painter, origin_px, y_px)
+
+        painter.setPen(QPen(color, 1))
+        label_size = QRectF(0.0, 0.0, 42.0, 18.0)
+        painter.drawText(
+            label_size.translated(x_px[0] + 4.0, x_px[1] - 9.0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            "PCS X",
+        )
+        painter.drawText(
+            label_size.translated(y_px[0] + 4.0, y_px[1] - 9.0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            "PCS Y",
+        )
+
+    def _draw_arrow(
+        self,
+        painter: QPainter,
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> None:
+        start_x, start_y = start
+        end_x, end_y = end
+        if math.hypot(end_x - start_x, end_y - start_y) <= 1.0:
+            return
+
+        painter.drawLine(QLineF(start_x, start_y, end_x, end_y))
+        angle = math.atan2(end_y - start_y, end_x - start_x)
+        head_length = 9.0
+        head_angle = math.radians(28.0)
+        for sign in (-1.0, 1.0):
+            head_x = end_x - head_length * math.cos(angle + sign * head_angle)
+            head_y = end_y - head_length * math.sin(angle + sign * head_angle)
+            painter.drawLine(QLineF(end_x, end_y, head_x, head_y))
+
     def _draw_height_colorbar(self, painter: QPainter, bounds: QRectF) -> None:
         del bounds
         if not self._height_map_points:
@@ -1340,6 +1416,13 @@ class StageView(QWidget):
         clamped_y = max(0.0, min(STAGE_Y_MAX_MM, y))
         px = bounds.left() + (1.0 - clamped_x / STAGE_X_MAX_MM) * bounds.width()
         py = bounds.top() + (clamped_y / STAGE_Y_MAX_MM) * bounds.height()
+        return px, py
+
+    def _map_stage_point_unclamped(
+        self, x: float, y: float, bounds: QRectF
+    ) -> tuple[float, float]:
+        px = bounds.left() + (1.0 - x / STAGE_X_MAX_MM) * bounds.width()
+        py = bounds.top() + (y / STAGE_Y_MAX_MM) * bounds.height()
         return px, py
 
     def _map_widget_point(
@@ -1686,6 +1769,7 @@ class MainWindow(QMainWindow):
         self.setup_motion_widgets: list[QWidget] = []
         self.homed_motion_widgets: list[QWidget] = []
         self.saved_serial_port = ""
+        self.stay_alive_enabled = False
         self.port_refreshing = False
         self.camera_config: dict[str, object] = {}
         self.camera_exposure_compensation = 0.0
@@ -1706,6 +1790,9 @@ class MainWindow(QMainWindow):
         self.connect_button = QPushButton("Connect")
         self.disconnect_button = QPushButton("Disconnect")
         self.disconnect_button.setEnabled(False)
+        self.stay_alive_check = QCheckBox("Stay alive")
+        self.stay_alive_timer = QTimer(self)
+        self.stay_alive_timer.setInterval(STAY_ALIVE_INTERVAL_MS)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -1732,6 +1819,7 @@ class MainWindow(QMainWindow):
         self.load_camera_config()
         self.refresh_alignment_cameras()
         self.refresh_ports()
+        self.initialize_pattern_transform_to_visible_bottom_left()
         self.update_height_map_preview()
         self.update_control_states()
 
@@ -1807,9 +1895,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.refresh_button, 0, 4)
         layout.addWidget(self.connect_button, 1, 1, 1, 2)
         layout.addWidget(self.disconnect_button, 1, 3, 1, 2)
-        layout.addWidget(self.home_button, 2, 1, 1, 2)
-        layout.addWidget(self.prepare_probe_button, 2, 3, 1, 2)
-        layout.addWidget(self.emergency_button, 3, 1, 1, 4)
+        layout.addWidget(self.stay_alive_check, 2, 1, 1, 4)
+        layout.addWidget(self.home_button, 3, 1, 1, 2)
+        layout.addWidget(self.prepare_probe_button, 3, 3, 1, 2)
+        layout.addWidget(self.emergency_button, 4, 1, 1, 4)
         self.refresh_button.clicked.connect(self.refresh_ports)
         self.setup_motion_widgets.extend([self.home_button, self.prepare_probe_button])
         return group
@@ -2233,6 +2322,8 @@ class MainWindow(QMainWindow):
         )
         self.connect_button.clicked.connect(self.connect_serial)
         self.disconnect_button.clicked.connect(self.disconnect_serial)
+        self.stay_alive_check.toggled.connect(self.on_stay_alive_toggled)
+        self.stay_alive_timer.timeout.connect(self.send_stay_alive_query)
         self.home_button.clicked.connect(self.home_stage)
         self.prepare_probe_button.clicked.connect(self.prepare_probe)
         self.emergency_button.clicked.connect(self.emergency_stop)
@@ -2287,6 +2378,7 @@ class MainWindow(QMainWindow):
 
     def load_conn_config(self) -> None:
         self.saved_serial_port = ""
+        self.stay_alive_enabled = False
         if not CONN_CONFIG_PATH.exists():
             return
 
@@ -2299,12 +2391,18 @@ class MainWindow(QMainWindow):
 
         if isinstance(data, dict):
             port = str(data.get("port", "") or "")
+            self.stay_alive_enabled = bool(data.get("stay_alive", False))
         else:
             port = str(data or "")
         self.saved_serial_port = port
+        if hasattr(self, "stay_alive_check"):
+            self.stay_alive_check.blockSignals(True)
+            self.stay_alive_check.setChecked(self.stay_alive_enabled)
+            self.stay_alive_check.blockSignals(False)
+            self.update_stay_alive_timer()
 
     def save_conn_config(self, port: str | None = None) -> None:
-        port = str(port or self.port_combo.currentData() or "")
+        port = str(port or self.port_combo.currentData() or self.saved_serial_port or "")
         if not port:
             return
 
@@ -2312,6 +2410,7 @@ class MainWindow(QMainWindow):
         data = {
             "version": 1,
             "port": port,
+            "stay_alive": self.stay_alive_enabled,
         }
         try:
             with CONN_CONFIG_PATH.open("w", encoding="utf-8") as file:
@@ -2319,6 +2418,28 @@ class MainWindow(QMainWindow):
                 file.write("\n")
         except OSError as exc:
             self.append_log(f"! failed to save connection config: {exc}")
+
+    def on_stay_alive_toggled(self, checked: bool) -> None:
+        self.stay_alive_enabled = checked
+        self.save_conn_config()
+        self.update_stay_alive_timer()
+
+    def update_stay_alive_timer(self) -> None:
+        if self.stay_alive_enabled and self.serial_thread is not None:
+            if not self.stay_alive_timer.isActive():
+                self.stay_alive_timer.start()
+        else:
+            self.stay_alive_timer.stop()
+
+    def send_stay_alive_query(self) -> None:
+        if not self.stay_alive_enabled or self.serial_thread is None:
+            self.update_stay_alive_timer()
+            return
+        if self.motion_busy or self.height_map_active or self.printing_active:
+            return
+        if not self.serial_thread.is_idle():
+            return
+        self.send_payload(STAY_ALIVE_PAYLOAD)
 
     def on_port_selection_changed(self) -> None:
         if self.port_refreshing:
@@ -2865,11 +2986,13 @@ class MainWindow(QMainWindow):
     def on_connected(self, port: str, baud: int) -> None:
         self.append_log(f"# connected to {port} at {baud} baud")
         self.statusBar().showMessage(f"Connected to {port} at {baud} baud", 5000)
+        self.update_stay_alive_timer()
         self.update_control_states()
 
     def on_disconnected(self) -> None:
         self.append_log("# disconnected")
         self.serial_thread = None
+        self.update_stay_alive_timer()
         self.current_tool_type = None
         self.maximum_z_position = None
         self.all_axes_homed = False
@@ -2963,23 +3086,14 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_pending_index = None
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
-        self.clear_pattern_alignment_reference_points()
         self.stage_view.set_pattern_selection_enabled(False)
         self.stage_view.set_selected_pattern_index(None)
         self.reset_pattern_print_progress()
-        self.initialize_pattern_transform_to_visible_bottom_left()
+        self.update_pattern_display()
         self.pattern_status_label.setText(f"Loaded {Path(path).name}")
         self.update_control_states()
 
     def save_pattern_alignment(self) -> None:
-        if not self.pattern_points:
-            QMessageBox.warning(
-                self,
-                "No Pattern",
-                "Load a pattern before saving alignment.",
-                QMessageBox.StandardButton.Ok,
-            )
-            return
         if (
             self.pattern_alignment_state is not None
             or self.motion_busy
@@ -3003,11 +3117,7 @@ class MainWindow(QMainWindow):
         data = {
             "version": 1,
             "transform": self.pattern_alignment_data(),
-            "pattern": {
-                "file": self.pattern_file_path or "",
-                "point_count": len(self.pattern_points),
-                "bbox": self.pattern_bbox_data(),
-            },
+            "alignment_points": self.pattern_alignment_reference_data(),
             "stage": {
                 "x_max_mm": STAGE_X_MAX_MM,
                 "y_max_mm": STAGE_Y_MAX_MM,
@@ -3030,14 +3140,6 @@ class MainWindow(QMainWindow):
         self.append_log(f"# saved pattern alignment: {path}")
 
     def load_pattern_alignment(self) -> None:
-        if not self.pattern_points:
-            QMessageBox.warning(
-                self,
-                "No Pattern",
-                "Load a pattern before applying alignment.",
-                QMessageBox.StandardButton.Ok,
-            )
-            return
         if (
             self.pattern_alignment_state is not None
             or self.motion_busy
@@ -3060,6 +3162,7 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8") as file:
                 data = json.load(file)
             alignment = self.parse_pattern_alignment_data(data)
+            alignment_points = self.parse_pattern_alignment_reference_data(data)
         except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
             QMessageBox.critical(
                 self,
@@ -3080,7 +3183,7 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_pending_index = None
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
-        self.clear_pattern_alignment_reference_points()
+        self.pattern_alignment_reference_points = alignment_points
         self.stage_view.set_pattern_selection_enabled(False)
         self.stage_view.set_selected_pattern_index(None)
         self.reset_pattern_print_progress()
@@ -3096,6 +3199,12 @@ class MainWindow(QMainWindow):
             "rotation_deg": self.pattern_rotation_deg,
             "scale": self.pattern_scale,
         }
+
+    def pattern_alignment_reference_data(self) -> list[dict[str, float]]:
+        return [
+            {"x": x, "y": y}
+            for x, y in self.pattern_alignment_reference_points
+        ]
 
     def pattern_bbox_data(self) -> dict[str, float]:
         if not self.pattern_points:
@@ -3133,6 +3242,38 @@ class MainWindow(QMainWindow):
         if scale <= 0.0:
             raise ValueError("alignment scale must be positive")
         return values
+
+    def parse_pattern_alignment_reference_data(
+        self, data
+    ) -> list[tuple[float, float]]:
+        if not isinstance(data, dict):
+            return []
+        raw_points = []
+        for key in ("alignment_points", "alignment_anchors", "reference_points"):
+            if key in data:
+                raw_points = data[key]
+                break
+        if raw_points is None:
+            return []
+        if not isinstance(raw_points, list):
+            raise ValueError("alignment points must be a list")
+
+        points: list[tuple[float, float]] = []
+        for index, point in enumerate(raw_points, start=1):
+            if isinstance(point, dict):
+                x = float(point["x"])
+                y = float(point["y"])
+            elif isinstance(point, list) and len(point) >= 2:
+                x = float(point[0])
+                y = float(point[1])
+            else:
+                raise ValueError(f"alignment point {index} is invalid")
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError(
+                    f"alignment point {index} contains non-finite values"
+                )
+            points.append((x, y))
+        return points
 
     def parse_pattern_file(self, path: Path) -> list[tuple[float, float]]:
         if path.suffix.lower() == ".json":
@@ -3212,9 +3353,10 @@ class MainWindow(QMainWindow):
 
         if not self.pattern_points:
             self.pattern_stats_label.setText("No pattern")
-            self.pattern_transform_label.setText("Offset: --\nRotation: --\nScale: --")
+            self.pattern_transform_label.setText(self.pattern_transform_text())
             if hasattr(self, "stage_view"):
                 self.stage_view.clear_pattern_points()
+            self.update_pattern_alignment_reference_display()
             return
 
         xs = [x for x, _y in self.pattern_points]
@@ -3223,15 +3365,18 @@ class MainWindow(QMainWindow):
             f"{len(self.pattern_points)} pts, "
             f"bbox {max(xs) - min(xs):.3f} x {max(ys) - min(ys):.3f} mm"
         )
-        self.pattern_transform_label.setText(
+        self.pattern_transform_label.setText(self.pattern_transform_text())
+        self.stage_view.set_pattern_points(self.transformed_pattern_points())
+        self.update_pattern_alignment_reference_display()
+
+    def pattern_transform_text(self) -> str:
+        return (
             f"Offset: X{self.pattern_work_offset_x:.3f} "
             f"Y{self.pattern_work_offset_y:.3f}\n"
             f"Rotation: {self.pattern_rotation_deg:.3f} deg\n"
             f"Scale: {self.pattern_scale:.5f} "
             f"({self.pattern_scale * 100.0:.2f}%)"
         )
-        self.stage_view.set_pattern_points(self.transformed_pattern_points())
-        self.update_pattern_alignment_reference_display()
 
     def transformed_pattern_points(self) -> list[tuple[int, float, float]]:
         return [
@@ -3297,12 +3442,25 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_reference_points = []
         if hasattr(self, "stage_view"):
             self.stage_view.set_pattern_alignment_points([])
+        self.update_pcs_axis_display()
 
     def update_pattern_alignment_reference_display(self) -> None:
         if not hasattr(self, "stage_view"):
             return
         self.stage_view.set_pattern_alignment_points(
             self.transformed_pattern_alignment_reference_positions()
+        )
+        self.update_pcs_axis_display()
+
+    def update_pcs_axis_display(self) -> None:
+        if not hasattr(self, "stage_view"):
+            return
+        self.stage_view.set_pcs_axis_points(
+            (
+                self.pattern_point_to_stage((0.0, 0.0)),
+                self.pattern_point_to_stage((PCS_AXIS_LENGTH_MM, 0.0)),
+                self.pattern_point_to_stage((0.0, PCS_AXIS_LENGTH_MM)),
+            )
         )
 
     def pattern_point_to_stage(self, point: tuple[float, float]) -> tuple[float, float]:
@@ -3596,10 +3754,10 @@ class MainWindow(QMainWindow):
             self.pattern_load_button.setEnabled(pattern_idle)
             self.pattern_reset_button.setEnabled(has_pattern and pattern_idle)
             self.pattern_save_alignment_button.setEnabled(
-                has_pattern and pattern_idle
+                pattern_idle
             )
             self.pattern_load_alignment_button.setEnabled(
-                has_pattern and pattern_idle
+                pattern_idle
             )
             self.pattern_align_button.setEnabled(
                 can_issue
@@ -3608,10 +3766,7 @@ class MainWindow(QMainWindow):
                 and self.pattern_alignment_state is None
             )
             self.pattern_anchor_align_button.setEnabled(
-                can_issue
-                and has_pattern
-                and not self.print_circle_editing
-                and self.pattern_alignment_state is None
+                homed_motion_allowed and pattern_idle
             )
             self.pattern_print_button.setEnabled(
                 can_issue
@@ -3806,7 +3961,7 @@ class MainWindow(QMainWindow):
         self.pattern_status_label.setText("Click first pattern point")
 
     def begin_anchor_pattern_alignment(self) -> None:
-        if not self.ensure_pattern_alignment_can_start():
+        if not self.ensure_anchor_alignment_can_start():
             return
 
         self.pattern_alignment_mode = "anchors"
@@ -3835,6 +3990,23 @@ class MainWindow(QMainWindow):
             return False
         if self.motion_busy or self.height_map_active or self.printing_active:
             self.append_log("! pattern alignment blocked: waiting for active motion")
+            return False
+        return True
+
+    def ensure_anchor_alignment_can_start(self) -> bool:
+        if self.serial_thread is None:
+            self.append_log("! not connected")
+            return False
+        if not self.all_axes_homed:
+            self.warn_not_homed()
+            return False
+        if (
+            self.motion_busy
+            or self.height_map_active
+            or self.printing_active
+            or self.print_circle_editing
+        ):
+            self.append_log("! anchor alignment blocked: waiting for active motion")
             return False
         return True
 
