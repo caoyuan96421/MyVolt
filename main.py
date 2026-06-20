@@ -101,20 +101,26 @@ STAGE_ZOOM_MIN = 1.0
 STAGE_ZOOM_MAX = 8.0
 STAGE_ZOOM_STEP = 1.2
 PCS_AXIS_LENGTH_MM = 10.0
+WORKFLOW_COMPLETE_STYLE = "color: #137333; font-weight: 700;"
+WORKFLOW_PENDING_STYLE = "color: black; font-weight: 500;"
 MIN_PRINT_CIRCLE_RADIUS_MM = 1.0
 CIRCLE_PRINT_SEGMENT_MM = 1.0
 SERIAL_COMMAND_INTERVAL_S = 0.01
-STAY_ALIVE_INTERVAL_MS = 60_000
+DEFAULT_STAY_ALIVE_POLL_SECONDS = 60
 STAY_ALIVE_PAYLOAD = "M400"
 MAXIMUM_Z_RETURN_MARGIN_MM = 0.5
+DEFAULT_HEIGHT_MAP_MAX_DEVIATION_WARNING_MM = 0.5
 CAMERA_CONFIG_PATH = Path("camera.json")
 ANCHOR_CONFIG_PATH = Path("anchors.json")
 CONN_CONFIG_PATH = Path("conn.json")
 LEVELING_CONFIG_PATH = Path("leveling.json")
+DOTPRINTING_CONFIG_PATH = Path("dotprinting.json")
+OPTIONS_CONFIG_PATH = Path("options.json")
 DEFAULT_PATTERN_ALIGNMENT_HEIGHT_MM = 2.0
 DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM = 2.0
 DEFAULT_ALIGNMENT_COARSE_XY_STEP_MM = 1.0
 DEFAULT_ALIGNMENT_FINE_XY_STEP_MM = 0.05
+ALIGNMENT_POINT_LABELS = ("1", "2", "3", "4")
 CAMERA_EXPOSURE_MIN_EV = -4.0
 CAMERA_EXPOSURE_MAX_EV = 4.0
 CAMERA_EXPOSURE_SCALE = 10
@@ -137,6 +143,105 @@ MEASUREMENT_RE = re.compile(
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+class OptionsDialog(QDialog):
+    def __init__(
+        self,
+        stay_alive_poll_seconds: int,
+        auto_margin_enabled: bool,
+        auto_margin_mm: float,
+        height_map_max_deviation_mm: float,
+        use_four_point_alignment: bool,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Options")
+        self.setModal(True)
+
+        self.stay_alive_spin = QSpinBox()
+        self.auto_margin_check = QCheckBox("Enable")
+        self.auto_margin_spin = QDoubleSpinBox()
+        self.height_map_deviation_spin = QDoubleSpinBox()
+        self.four_point_alignment_check = QCheckBox("Use 4-point alignment")
+
+        self._build_ui(
+            stay_alive_poll_seconds,
+            auto_margin_enabled,
+            auto_margin_mm,
+            height_map_max_deviation_mm,
+            use_four_point_alignment,
+        )
+
+    def _build_ui(
+        self,
+        stay_alive_poll_seconds: int,
+        auto_margin_enabled: bool,
+        auto_margin_mm: float,
+        height_map_max_deviation_mm: float,
+        use_four_point_alignment: bool,
+    ) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        form = QFormLayout()
+
+        self.stay_alive_spin.setRange(1, 3600)
+        self.stay_alive_spin.setValue(stay_alive_poll_seconds)
+        self.stay_alive_spin.setSuffix(" s")
+        form.addRow("Stay alive polling period", self.stay_alive_spin)
+
+        margin_widget = QWidget()
+        margin_layout = QHBoxLayout(margin_widget)
+        margin_layout.setContentsMargins(0, 0, 0, 0)
+        margin_layout.setSpacing(6)
+        self.auto_margin_check.setChecked(auto_margin_enabled)
+        self.auto_margin_spin.setRange(0.0, 100.0)
+        self.auto_margin_spin.setDecimals(3)
+        self.auto_margin_spin.setValue(auto_margin_mm)
+        self.auto_margin_spin.setSuffix(" mm")
+        self.auto_margin_spin.setEnabled(auto_margin_enabled)
+        self.auto_margin_check.toggled.connect(self.auto_margin_spin.setEnabled)
+        margin_layout.addWidget(self.auto_margin_check)
+        margin_layout.addWidget(self.auto_margin_spin, stretch=1)
+        form.addRow("Auto margin for height map", margin_widget)
+
+        self.height_map_deviation_spin.setRange(0.0, 100.0)
+        self.height_map_deviation_spin.setDecimals(3)
+        self.height_map_deviation_spin.setValue(height_map_max_deviation_mm)
+        self.height_map_deviation_spin.setSuffix(" mm")
+        form.addRow("Height map warning deviation", self.height_map_deviation_spin)
+
+        self.four_point_alignment_check.setChecked(use_four_point_alignment)
+        form.addRow("", self.four_point_alignment_check)
+
+        layout.addLayout(form)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_button = QPushButton("OK")
+        cancel_button = QPushButton("Cancel")
+        ok_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(ok_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+
+    def stay_alive_poll_seconds(self) -> int:
+        return self.stay_alive_spin.value()
+
+    def auto_margin_enabled(self) -> bool:
+        return self.auto_margin_check.isChecked()
+
+    def auto_margin_mm(self) -> float:
+        return self.auto_margin_spin.value()
+
+    def height_map_max_deviation_mm(self) -> float:
+        return self.height_map_deviation_spin.value()
+
+    def use_four_point_alignment(self) -> bool:
+        return self.four_point_alignment_check.isChecked()
 
 
 class RotatableCameraView(QGraphicsView):
@@ -287,7 +392,8 @@ class AlignmentProcedureDialog(QDialog):
         self,
         controller,
         mode: str,
-        default_anchors: tuple[tuple[float, float], tuple[float, float]],
+        default_anchors: list[tuple[float, float]],
+        point_count: int,
         default_alignment_height: float,
         default_coarse_xy_step: float,
         default_fine_xy_step: float,
@@ -296,6 +402,7 @@ class AlignmentProcedureDialog(QDialog):
         super().__init__(parent)
         self.controller = controller
         self.mode = mode
+        self.point_count = point_count
         self.step_labels: list[QLabel] = []
         self.anchor_spins: list[QDoubleSpinBox] = []
         self.alignment_height_spin = QDoubleSpinBox()
@@ -314,7 +421,7 @@ class AlignmentProcedureDialog(QDialog):
 
     def _build_ui(
         self,
-        default_anchors: tuple[tuple[float, float], tuple[float, float]],
+        default_anchors: list[tuple[float, float]],
         default_alignment_height: float,
         default_coarse_xy_step: float,
         default_fine_xy_step: float,
@@ -363,7 +470,7 @@ class AlignmentProcedureDialog(QDialog):
 
     def _build_anchor_group(
         self,
-        default_anchors: tuple[tuple[float, float], tuple[float, float]],
+        default_anchors: list[tuple[float, float]],
     ) -> QGroupBox:
         group = QGroupBox("Anchor PCS Positions")
         layout = QGridLayout(group)
@@ -371,14 +478,11 @@ class AlignmentProcedureDialog(QDialog):
         layout.addWidget(QLabel("X"), 0, 1)
         layout.addWidget(QLabel("Y"), 0, 2)
 
-        for row, ((x_value, y_value), label) in enumerate(
-            zip(default_anchors, ("Anchor 1", "Anchor 2")),
-            start=1,
-        ):
+        for row, (x_value, y_value) in enumerate(default_anchors, start=1):
             x_spin = self._build_anchor_spin(x_value)
             y_spin = self._build_anchor_spin(y_value)
             self.anchor_spins.extend([x_spin, y_spin])
-            layout.addWidget(QLabel(label), row, 0)
+            layout.addWidget(QLabel(f"Anchor {row}"), row, 0)
             layout.addWidget(x_spin, row, 1)
             layout.addWidget(y_spin, row, 2)
 
@@ -430,23 +534,24 @@ class AlignmentProcedureDialog(QDialog):
         layout = QVBoxLayout(group)
         layout.setSpacing(3)
 
-        steps = (
-            [
-                "Select point 1",
-                "Go to point 1",
-                "Fine-align point 1",
-                "Select point 2",
-                "Go to point 2",
-                "Fine-align point 2",
-            ]
-            if self.mode == "click"
-            else [
-                "Go to anchor 1",
-                "Fine-align anchor 1",
-                "Go to anchor 2",
-                "Fine-align anchor 2",
-            ]
-        )
+        steps = []
+        for index in range(self.point_count):
+            label = ALIGNMENT_POINT_LABELS[index]
+            if self.mode == "click":
+                steps.extend(
+                    [
+                        f"Select point {label}",
+                        f"Go to point {label}",
+                        f"Fine-align point {label}",
+                    ]
+                )
+            else:
+                steps.extend(
+                    [
+                        f"Go to anchor {label}",
+                        f"Fine-align anchor {label}",
+                    ]
+                )
         for index, step in enumerate(steps):
             label = QLabel(step)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -495,11 +600,16 @@ class AlignmentProcedureDialog(QDialog):
     def _jog_xy(self, x_direction: float, y_direction: float) -> None:
         self.controller.alignment_dialog_jog_xy(x_direction, y_direction)
 
-    def anchor_points(self) -> tuple[tuple[float, float], tuple[float, float]]:
-        return (
-            (self.anchor_spins[0].value(), self.anchor_spins[1].value()),
-            (self.anchor_spins[2].value(), self.anchor_spins[3].value()),
-        )
+    def anchor_points(self) -> list[tuple[float, float]]:
+        points = []
+        for index in range(0, len(self.anchor_spins), 2):
+            points.append(
+                (
+                    self.anchor_spins[index].value(),
+                    self.anchor_spins[index + 1].value(),
+                )
+            )
+        return points
 
     def alignment_height(self) -> float:
         return self.alignment_height_spin.value()
@@ -1736,25 +1846,37 @@ class MainWindow(QMainWindow):
         self.height_map_finishing = False
         self.height_map_abort_requested = False
         self.height_map_probe_phase: str | None = None
+        self.height_map_completed = False
         self.pattern_points: list[tuple[float, float]] = []
         self.pattern_file_path: str | None = None
         self.pattern_work_offset_x = 0.0
         self.pattern_work_offset_y = 0.0
+        self.pattern_transform_a11 = -1.0
+        self.pattern_transform_a12 = 0.0
+        self.pattern_transform_a21 = 0.0
+        self.pattern_transform_a22 = -1.0
         self.pattern_rotation_deg = 0.0
         self.pattern_scale = 1.0
+        self.pattern_scale_x = 1.0
+        self.pattern_scale_y = 1.0
+        self.pattern_orthogonality_error_deg = 0.0
         self.pattern_alignment_height = DEFAULT_PATTERN_ALIGNMENT_HEIGHT_MM
         self.alignment_coarse_xy_step = DEFAULT_ALIGNMENT_COARSE_XY_STEP_MM
         self.alignment_fine_xy_step = DEFAULT_ALIGNMENT_FINE_XY_STEP_MM
+        self.use_four_point_alignment = False
         self.pattern_alignment_mode: str | None = None
         self.pattern_alignment_state: str | None = None
         self.pattern_alignment_first: tuple[int, float, float, float, float] | None = None
         self.pattern_alignment_pending_index: int | None = None
-        self.pattern_alignment_anchor_points: tuple[
-            tuple[float, float],
-            tuple[float, float],
-        ] | None = None
+        self.pattern_alignment_point_count = 2
+        self.pattern_alignment_current_index = 0
+        self.pattern_alignment_anchor_points: list[tuple[float, float]] | None = None
         self.pattern_alignment_anchor_first: tuple[float, float, float, float] | None = None
         self.pattern_alignment_reference_points: list[tuple[float, float]] = []
+        self.pattern_alignment_measurements: list[
+            tuple[float, float, float, float]
+        ] = []
+        self.pattern_alignment_completed = False
         self.alignment_procedure_dialog: AlignmentProcedureDialog | None = None
         self.pattern_print_active = False
         self.pending_pattern_print_points: list[tuple[int, float, float]] | None = None
@@ -1767,19 +1889,23 @@ class MainWindow(QMainWindow):
         self.pending_print_circle: tuple[float, float, float] | None = None
         self.all_axes_homed = False
         self.motion_busy = False
+        self.serial_connected = False
         self.general_command_widgets: list[QWidget] = []
         self.setup_motion_widgets: list[QWidget] = []
         self.homed_motion_widgets: list[QWidget] = []
         self.saved_serial_port = ""
         self.stay_alive_enabled = False
+        self.stay_alive_poll_seconds = DEFAULT_STAY_ALIVE_POLL_SECONDS
+        self.auto_height_map_margin_enabled = True
+        self.auto_height_map_margin_mm = DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM
+        self.height_map_max_deviation_warning_mm = (
+            DEFAULT_HEIGHT_MAP_MAX_DEVIATION_WARNING_MM
+        )
         self.port_refreshing = False
         self.camera_config: dict[str, object] = {}
         self.camera_exposure_compensation = 0.0
         self.camera_view_rotations = [0, 0]
-        self.pattern_anchor_defaults: tuple[
-            tuple[float, float],
-            tuple[float, float],
-        ] | None = None
+        self.pattern_anchor_defaults: list[tuple[float, float]] | None = None
         self.camera_devices_by_id = {}
         self.alignment_cameras = [None, None]
         self.alignment_camera_sessions = [None, None]
@@ -1787,6 +1913,7 @@ class MainWindow(QMainWindow):
         self.alignment_video_outputs: list[QWidget] = []
         self.alignment_refreshing = False
         self.leveling_config_loading = False
+        self.dotprinting_config_loading = False
 
         self.port_combo = QComboBox()
         self.connect_button = QPushButton("Connect")
@@ -1794,7 +1921,7 @@ class MainWindow(QMainWindow):
         self.disconnect_button.setEnabled(False)
         self.stay_alive_check = QCheckBox("Stay alive")
         self.stay_alive_timer = QTimer(self)
-        self.stay_alive_timer.setInterval(STAY_ALIVE_INTERVAL_MS)
+        self.apply_stay_alive_poll_interval()
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -1815,9 +1942,11 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_ui()
+        self.load_options_config()
         self.load_conn_config()
         self.load_anchor_config()
         self.load_leveling_config()
+        self.load_dotprinting_config()
         self.load_camera_config()
         self.refresh_alignment_cameras()
         self.refresh_ports()
@@ -1837,7 +1966,10 @@ class MainWindow(QMainWindow):
         left_panel = QVBoxLayout()
         left_panel.setSpacing(6)
         left_panel.addWidget(self._build_hardware_group())
-        left_panel.addWidget(self._build_stage_control_group())
+        left_panel.addWidget(self._build_workflow_group())
+        self.stage_control_group = self._build_stage_control_group()
+        self.stage_control_group.setVisible(False)
+        left_panel.addWidget(self.stage_control_group)
         left_panel.addWidget(self._build_temperature_group())
         left_panel.addWidget(self._build_raw_log_group(), stretch=1)
 
@@ -1851,7 +1983,9 @@ class MainWindow(QMainWindow):
         right_panel.setSpacing(6)
         right_panel.addWidget(self._build_pattern_group())
         right_panel.addWidget(self._build_leveling_group())
-        right_panel.addWidget(self._build_printing_group())
+        self.printing_group = self._build_printing_group()
+        self.printing_group.setVisible(False)
+        right_panel.addWidget(self.printing_group)
         right_panel.addStretch(1)
 
         workspace_layout.addLayout(left_panel, stretch=0)
@@ -1860,7 +1994,35 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(workspace_layout, stretch=1)
 
         self.setCentralWidget(root)
+        self._build_menu_bar()
         self._build_status_bar()
+
+    def _build_menu_bar(self) -> None:
+        options_action = self.menuBar().addAction("Options...")
+        options_action.triggered.connect(self.show_options_dialog)
+
+    def show_options_dialog(self) -> None:
+        dialog = OptionsDialog(
+            self.stay_alive_poll_seconds,
+            self.auto_height_map_margin_enabled,
+            self.auto_height_map_margin_mm,
+            self.height_map_max_deviation_warning_mm,
+            self.use_four_point_alignment,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.stay_alive_poll_seconds = dialog.stay_alive_poll_seconds()
+        self.auto_height_map_margin_enabled = dialog.auto_margin_enabled()
+        self.auto_height_map_margin_mm = dialog.auto_margin_mm()
+        self.height_map_max_deviation_warning_mm = (
+            dialog.height_map_max_deviation_mm()
+        )
+        self.use_four_point_alignment = dialog.use_four_point_alignment()
+        self.apply_stay_alive_poll_interval()
+        self.save_options_config()
+        self.append_log("# options updated")
 
     def _build_raw_payload_group(self) -> QGroupBox:
         group = QGroupBox("Raw Payload")
@@ -1905,10 +2067,35 @@ class MainWindow(QMainWindow):
         self.setup_motion_widgets.extend([self.home_button, self.prepare_probe_button])
         return group
 
+    def _build_workflow_group(self) -> QGroupBox:
+        group = QGroupBox("Workflow")
+        group.setMaximumWidth(360)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        self.workflow_status_labels: dict[str, QLabel] = {}
+        for key, text in (
+            ("connected", "Connected"),
+            ("homed", "Stage Homed"),
+            ("height_map", "Height map completed"),
+            ("aligned", "Aligned"),
+            ("pattern", "Pattern Loaded"),
+            ("dispenser", "Dispensor Loaded"),
+        ):
+            label = QLabel(text)
+            label.setStyleSheet(WORKFLOW_PENDING_STYLE)
+            self.workflow_status_labels[key] = label
+            layout.addWidget(label)
+        return group
+
     def _build_temperature_group(self) -> QGroupBox:
         group = QGroupBox("Temperature")
         group.setMaximumWidth(360)
-        layout = QHBoxLayout(group)
+        layout = QGridLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(4)
         self.temp_spin = QDoubleSpinBox()
         self.temp_spin.setRange(0.0, 260.0)
         self.temp_spin.setDecimals(1)
@@ -1920,12 +2107,12 @@ class MainWindow(QMainWindow):
         self.heat_duration_spin.setSuffix(" s")
         self.set_temp_button = QPushButton("Set")
         self.stop_heat_button = QPushButton("Off")
-        layout.addWidget(QLabel("Target"))
-        layout.addWidget(self.temp_spin)
-        layout.addWidget(QLabel("Duration"))
-        layout.addWidget(self.heat_duration_spin)
-        layout.addWidget(self.set_temp_button)
-        layout.addWidget(self.stop_heat_button)
+        layout.addWidget(QLabel("Target"), 0, 0)
+        layout.addWidget(self.temp_spin, 0, 1)
+        layout.addWidget(QLabel("Duration"), 0, 2)
+        layout.addWidget(self.heat_duration_spin, 0, 3)
+        layout.addWidget(self.set_temp_button, 1, 0, 1, 2)
+        layout.addWidget(self.stop_heat_button, 1, 2, 1, 2)
         self.general_command_widgets.extend(
             [
                 self.temp_spin,
@@ -2283,6 +2470,12 @@ class MainWindow(QMainWindow):
         self.pattern_travel_height_spin.setValue(2.0)
         self.pattern_travel_height_spin.setSuffix(" mm")
 
+        self.pattern_lifting_speed_spin = QDoubleSpinBox()
+        self.pattern_lifting_speed_spin.setRange(0.01, 1000.0)
+        self.pattern_lifting_speed_spin.setDecimals(2)
+        self.pattern_lifting_speed_spin.setValue(1.0)
+        self.pattern_lifting_speed_spin.setSuffix(" mm/s")
+
         layout.addRow("", action_layout)
         layout.addRow("", alignment_mode_layout)
         layout.addRow("", alignment_file_layout)
@@ -2292,6 +2485,7 @@ class MainWindow(QMainWindow):
         layout.addRow("Kick", self.pattern_kick_spin)
         layout.addRow("Retract", self.pattern_retract_spin)
         layout.addRow("Travel height", self.pattern_travel_height_spin)
+        layout.addRow("Lifting speed", self.pattern_lifting_speed_spin)
         layout.addRow("Status", self.pattern_status_label)
         layout.addRow("", self.pattern_print_button)
         return group
@@ -2353,6 +2547,14 @@ class MainWindow(QMainWindow):
         self.pattern_save_alignment_button.clicked.connect(self.save_pattern_alignment)
         self.pattern_load_alignment_button.clicked.connect(self.load_pattern_alignment)
         self.pattern_print_button.clicked.connect(self.on_pattern_print_button_clicked)
+        for spin in (
+            self.pattern_print_height_spin,
+            self.pattern_kick_spin,
+            self.pattern_retract_spin,
+            self.pattern_travel_height_spin,
+            self.pattern_lifting_speed_spin,
+        ):
+            spin.valueChanged.connect(lambda _value: self.save_dotprinting_config())
         self.stage_view.pattern_point_selected.connect(self.on_pattern_point_selected)
         self.stage_view.work_area_changed.connect(
             lambda _x, _y, _width, _height: self.on_leveling_settings_changed()
@@ -2377,6 +2579,99 @@ class MainWindow(QMainWindow):
                     self.port_combo.setCurrentIndex(index)
         finally:
             self.port_refreshing = False
+
+    def apply_stay_alive_poll_interval(self) -> None:
+        interval_ms = max(1, int(self.stay_alive_poll_seconds)) * 1000
+        self.stay_alive_timer.setInterval(interval_ms)
+
+    def load_options_config(self) -> None:
+        if not OPTIONS_CONFIG_PATH.exists():
+            self.apply_stay_alive_poll_interval()
+            return
+
+        try:
+            with OPTIONS_CONFIG_PATH.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            self.append_log(f"! failed to load options config: {exc}")
+            self.apply_stay_alive_poll_interval()
+            return
+
+        if not isinstance(data, dict):
+            self.append_log("! failed to load options config: expected JSON object")
+            self.apply_stay_alive_poll_interval()
+            return
+
+        try:
+            stay_alive_seconds = data.get("stay_alive_poll_seconds")
+            if stay_alive_seconds is not None:
+                value = float(stay_alive_seconds)
+                if not math.isfinite(value):
+                    raise ValueError("stay_alive_poll_seconds must be finite")
+                self.stay_alive_poll_seconds = int(
+                    clamp(round(value), 1, 3600)
+                )
+
+            auto_margin = data.get("auto_height_map_margin", {})
+            if auto_margin is None:
+                auto_margin = {}
+            if isinstance(auto_margin, dict):
+                self.auto_height_map_margin_enabled = bool(
+                    auto_margin.get(
+                        "enabled",
+                        self.auto_height_map_margin_enabled,
+                    )
+                )
+                margin_value = auto_margin.get(
+                    "margin_mm",
+                    data.get("auto_height_map_margin_mm"),
+                )
+            else:
+                margin_value = data.get("auto_height_map_margin_mm")
+            if margin_value is not None:
+                value = float(margin_value)
+                if not math.isfinite(value):
+                    raise ValueError("auto height-map margin must be finite")
+                self.auto_height_map_margin_mm = clamp(value, 0.0, 100.0)
+
+            deviation_value = data.get("height_map_max_deviation_warning_mm")
+            if deviation_value is not None:
+                value = float(deviation_value)
+                if not math.isfinite(value):
+                    raise ValueError("height-map warning deviation must be finite")
+                self.height_map_max_deviation_warning_mm = clamp(
+                    value,
+                    0.0,
+                    100.0,
+                )
+            if "use_four_point_alignment" in data:
+                self.use_four_point_alignment = bool(
+                    data["use_four_point_alignment"]
+                )
+        except (TypeError, ValueError) as exc:
+            self.append_log(f"! failed to parse options config: {exc}")
+
+        self.apply_stay_alive_poll_interval()
+
+    def save_options_config(self) -> None:
+        data = {
+            "version": 1,
+            "stay_alive_poll_seconds": self.stay_alive_poll_seconds,
+            "auto_height_map_margin": {
+                "enabled": self.auto_height_map_margin_enabled,
+                "margin_mm": self.auto_height_map_margin_mm,
+            },
+            "height_map_max_deviation_warning_mm": (
+                self.height_map_max_deviation_warning_mm
+            ),
+            "use_four_point_alignment": self.use_four_point_alignment,
+        }
+        try:
+            with OPTIONS_CONFIG_PATH.open("w", encoding="utf-8") as file:
+                json.dump(data, file, indent=2)
+                file.write("\n")
+        except OSError as exc:
+            self.append_log(f"! failed to save options config: {exc}")
 
     def load_conn_config(self) -> None:
         self.saved_serial_port = ""
@@ -2487,7 +2782,7 @@ class MainWindow(QMainWindow):
 
     def anchor_config_has_points(self, data) -> bool:
         if isinstance(data, list):
-            return len(data) == 2
+            return len(data) >= 2
         if not isinstance(data, dict):
             return False
         if "anchors" in data:
@@ -2496,23 +2791,23 @@ class MainWindow(QMainWindow):
 
     def parse_anchor_config_data(
         self, data
-    ) -> tuple[tuple[float, float], tuple[float, float]]:
+    ) -> list[tuple[float, float]]:
         if isinstance(data, dict):
             if "anchors" in data:
                 data = data["anchors"]
-            if "anchor_1" in data and "anchor_2" in data:
-                return (
-                    self.parse_anchor_point_data(data["anchor_1"]),
-                    self.parse_anchor_point_data(data["anchor_2"]),
-                )
+            else:
+                points = []
+                for index in range(1, 5):
+                    key = f"anchor_{index}"
+                    if key in data:
+                        points.append(self.parse_anchor_point_data(data[key]))
+                if len(points) >= 2:
+                    return points
 
-        if isinstance(data, list) and len(data) == 2:
-            return (
-                self.parse_anchor_point_data(data[0]),
-                self.parse_anchor_point_data(data[1]),
-            )
+        if isinstance(data, list) and len(data) >= 2:
+            return [self.parse_anchor_point_data(point) for point in data]
 
-        raise ValueError("expected two anchor points")
+        raise ValueError("expected at least two anchor points")
 
     def parse_anchor_point_data(self, data) -> tuple[float, float]:
         if isinstance(data, dict):
@@ -2523,7 +2818,7 @@ class MainWindow(QMainWindow):
 
     def save_anchor_config(
         self,
-        anchor_points: tuple[tuple[float, float], tuple[float, float]] | None = None,
+        anchor_points: list[tuple[float, float]] | None = None,
         alignment_height: float | None = None,
         coarse_xy_step: float | None = None,
         fine_xy_step: float | None = None,
@@ -2544,14 +2839,10 @@ class MainWindow(QMainWindow):
             "fine_xy_step": self.alignment_fine_xy_step,
         }
         if self.pattern_anchor_defaults is not None:
-            data["anchor_1"] = {
-                "x": self.pattern_anchor_defaults[0][0],
-                "y": self.pattern_anchor_defaults[0][1],
-            }
-            data["anchor_2"] = {
-                "x": self.pattern_anchor_defaults[1][0],
-                "y": self.pattern_anchor_defaults[1][1],
-            }
+            data["anchors"] = [
+                {"x": x, "y": y}
+                for x, y in self.pattern_anchor_defaults
+            ]
         try:
             with ANCHOR_CONFIG_PATH.open("w", encoding="utf-8") as file:
                 json.dump(data, file, indent=2)
@@ -2667,6 +2958,87 @@ class MainWindow(QMainWindow):
     def on_leveling_settings_changed(self) -> None:
         self.update_height_map_preview()
         self.save_leveling_config()
+
+    def load_dotprinting_config(self) -> None:
+        if not DOTPRINTING_CONFIG_PATH.exists():
+            return
+
+        try:
+            with DOTPRINTING_CONFIG_PATH.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            self.append_log(f"! failed to load dot printing config: {exc}")
+            return
+
+        if not isinstance(data, dict):
+            self.append_log("! failed to load dot printing config: expected JSON object")
+            return
+
+        self.dotprinting_config_loading = True
+        try:
+            self.apply_dotprinting_spin_value(
+                data,
+                "print_height_mm",
+                self.pattern_print_height_spin,
+            )
+            self.apply_dotprinting_spin_value(
+                data,
+                "kick_um",
+                self.pattern_kick_spin,
+            )
+            self.apply_dotprinting_spin_value(
+                data,
+                "retract_um",
+                self.pattern_retract_spin,
+            )
+            self.apply_dotprinting_spin_value(
+                data,
+                "travel_height_mm",
+                self.pattern_travel_height_spin,
+            )
+            self.apply_dotprinting_spin_value(
+                data,
+                "lifting_speed_mm_s",
+                self.pattern_lifting_speed_spin,
+            )
+        except (TypeError, ValueError) as exc:
+            self.append_log(f"! failed to parse dot printing config: {exc}")
+        finally:
+            self.dotprinting_config_loading = False
+
+    def apply_dotprinting_spin_value(
+        self,
+        data: dict,
+        key: str,
+        spin: QDoubleSpinBox,
+    ) -> None:
+        if key not in data:
+            return
+        value = float(data[key])
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite")
+        spin.setValue(clamp(value, spin.minimum(), spin.maximum()))
+
+    def save_dotprinting_config(self) -> None:
+        if self.dotprinting_config_loading:
+            return
+        if not hasattr(self, "pattern_lifting_speed_spin"):
+            return
+
+        data = {
+            "version": 1,
+            "print_height_mm": self.pattern_print_height_spin.value(),
+            "kick_um": self.pattern_kick_spin.value(),
+            "retract_um": self.pattern_retract_spin.value(),
+            "travel_height_mm": self.pattern_travel_height_spin.value(),
+            "lifting_speed_mm_s": self.pattern_lifting_speed_spin.value(),
+        }
+        try:
+            with DOTPRINTING_CONFIG_PATH.open("w", encoding="utf-8") as file:
+                json.dump(data, file, indent=2)
+                file.write("\n")
+        except OSError as exc:
+            self.append_log(f"! failed to save dot printing config: {exc}")
 
     def load_camera_config(self) -> None:
         self.camera_config = {}
@@ -2961,6 +3333,7 @@ class MainWindow(QMainWindow):
         self.current_tool_type = None
         self.maximum_z_position = None
         self.all_axes_homed = False
+        self.serial_connected = False
         self.motion_busy = False
         self.reset_tool_offsets()
         self.reset_height_map()
@@ -2986,6 +3359,7 @@ class MainWindow(QMainWindow):
             self.serial_thread.wait(1500)
 
     def on_connected(self, port: str, baud: int) -> None:
+        self.serial_connected = True
         self.append_log(f"# connected to {port} at {baud} baud")
         self.statusBar().showMessage(f"Connected to {port} at {baud} baud", 5000)
         self.update_stay_alive_timer()
@@ -2994,6 +3368,7 @@ class MainWindow(QMainWindow):
     def on_disconnected(self) -> None:
         self.append_log("# disconnected")
         self.serial_thread = None
+        self.serial_connected = False
         self.update_stay_alive_timer()
         self.current_tool_type = None
         self.maximum_z_position = None
@@ -3037,6 +3412,7 @@ class MainWindow(QMainWindow):
         self.height_map_finishing = False
         self.height_map_abort_requested = False
         self.height_map_probe_phase = None
+        self.height_map_completed = False
         if hasattr(self, "stage_view"):
             self.stage_view.set_height_map_points([])
         if hasattr(self, "height_map_status_label"):
@@ -3117,7 +3493,7 @@ class MainWindow(QMainWindow):
             path += ".json"
 
         data = {
-            "version": 1,
+            "version": 2,
             "transform": self.pattern_alignment_data(),
             "alignment_points": self.pattern_alignment_reference_data(),
             "stage": {
@@ -3164,6 +3540,7 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8") as file:
                 data = json.load(file)
             alignment = self.parse_pattern_alignment_data(data)
+            alignment_measurements = self.parse_pattern_alignment_measurement_data(data)
             alignment_points = self.parse_pattern_alignment_reference_data(data)
         except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
             QMessageBox.critical(
@@ -3175,16 +3552,24 @@ class MainWindow(QMainWindow):
             self.append_log(f"! failed to load alignment: {exc}")
             return
 
-        self.pattern_work_offset_x = alignment["offset_x"]
-        self.pattern_work_offset_y = alignment["offset_y"]
-        self.pattern_rotation_deg = alignment["rotation_deg"]
-        self.pattern_scale = alignment["scale"]
+        self.set_pattern_transform_matrix(
+            alignment["a11"],
+            alignment["a12"],
+            alignment["a21"],
+            alignment["a22"],
+            alignment["offset_x"],
+            alignment["offset_y"],
+            update_display=False,
+        )
         self.pattern_alignment_state = None
         self.pattern_alignment_mode = None
         self.pattern_alignment_first = None
         self.pattern_alignment_pending_index = None
+        self.pattern_alignment_current_index = 0
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
+        self.pattern_alignment_completed = True
+        self.pattern_alignment_measurements = alignment_measurements
         self.pattern_alignment_reference_points = alignment_points
         self.stage_view.set_pattern_selection_enabled(False)
         self.stage_view.set_selected_pattern_index(None)
@@ -3194,17 +3579,33 @@ class MainWindow(QMainWindow):
         self.append_log(f"# loaded pattern alignment: {path}")
         self.update_control_states()
 
-    def pattern_alignment_data(self) -> dict[str, float]:
+    def pattern_alignment_data(self) -> dict[str, object]:
         return {
             "offset_x": self.pattern_work_offset_x,
             "offset_y": self.pattern_work_offset_y,
+            "matrix": [
+                [self.pattern_transform_a11, self.pattern_transform_a12],
+                [self.pattern_transform_a21, self.pattern_transform_a22],
+            ],
             "rotation_deg": self.pattern_rotation_deg,
             "scale": self.pattern_scale,
+            "scale_x": self.pattern_scale_x,
+            "scale_y": self.pattern_scale_y,
+            "orthogonality_error_deg": self.pattern_orthogonality_error_deg,
         }
 
-    def pattern_alignment_reference_data(self) -> list[dict[str, float]]:
+    def pattern_alignment_reference_data(self) -> list[dict[str, object]]:
+        if self.pattern_alignment_measurements:
+            return [
+                {
+                    "nominal": {"x": nominal_x, "y": nominal_y},
+                    "measured": {"x": stage_x, "y": stage_y},
+                }
+                for nominal_x, nominal_y, stage_x, stage_y
+                in self.pattern_alignment_measurements
+            ]
         return [
-            {"x": x, "y": y}
+            {"nominal": {"x": x, "y": y}}
             for x, y in self.pattern_alignment_reference_points
         ]
 
@@ -3229,32 +3630,86 @@ class MainWindow(QMainWindow):
 
         offset_x = float(transform.get("offset_x", transform.get("work_offset_x")))
         offset_y = float(transform.get("offset_y", transform.get("work_offset_y")))
-        rotation_deg = float(
-            transform.get("rotation_deg", transform.get("rotation", 0.0))
-        )
-        scale = float(transform.get("scale", 1.0))
+        matrix = transform.get("matrix")
+        if matrix is not None:
+            a11, a12, a21, a22 = self.parse_transform_matrix(matrix)
+        else:
+            rotation_deg = float(
+                transform.get("rotation_deg", transform.get("rotation", 0.0))
+            )
+            scale = float(transform.get("scale", 1.0))
+            if scale <= 0.0:
+                raise ValueError("alignment scale must be positive")
+            a11, a12, a21, a22 = self.similarity_matrix_from_rotation_scale(
+                rotation_deg,
+                scale,
+            )
         values = {
             "offset_x": offset_x,
             "offset_y": offset_y,
-            "rotation_deg": rotation_deg,
-            "scale": scale,
+            "a11": a11,
+            "a12": a12,
+            "a21": a21,
+            "a22": a22,
         }
         if any(not math.isfinite(value) for value in values.values()):
             raise ValueError("alignment contains non-finite values")
-        if scale <= 0.0:
-            raise ValueError("alignment scale must be positive")
         return values
+
+    def parse_transform_matrix(self, matrix) -> tuple[float, float, float, float]:
+        if (
+            isinstance(matrix, list)
+            and len(matrix) == 2
+            and all(isinstance(row, list) and len(row) == 2 for row in matrix)
+        ):
+            return (
+                float(matrix[0][0]),
+                float(matrix[0][1]),
+                float(matrix[1][0]),
+                float(matrix[1][1]),
+            )
+        if isinstance(matrix, dict):
+            return (
+                float(matrix["a11"]),
+                float(matrix["a12"]),
+                float(matrix["a21"]),
+                float(matrix["a22"]),
+            )
+        raise ValueError("alignment matrix must be a 2x2 array or object")
+
+    def parse_pattern_alignment_measurement_data(
+        self, data
+    ) -> list[tuple[float, float, float, float]]:
+        if not isinstance(data, dict):
+            return []
+        raw_points = self.raw_alignment_points_from_data(data)
+        if not raw_points:
+            return []
+
+        measurements: list[tuple[float, float, float, float]] = []
+        for index, point in enumerate(raw_points, start=1):
+            if not isinstance(point, dict) or "measured" not in point:
+                continue
+            nominal = point.get("nominal", point)
+            measured = point["measured"]
+            nominal_x, nominal_y = self.parse_xy_pair(nominal)
+            stage_x, stage_y = self.parse_xy_pair(measured)
+            if not all(
+                math.isfinite(value)
+                for value in (nominal_x, nominal_y, stage_x, stage_y)
+            ):
+                raise ValueError(
+                    f"alignment measurement {index} contains non-finite values"
+                )
+            measurements.append((nominal_x, nominal_y, stage_x, stage_y))
+        return measurements
 
     def parse_pattern_alignment_reference_data(
         self, data
     ) -> list[tuple[float, float]]:
         if not isinstance(data, dict):
             return []
-        raw_points = []
-        for key in ("alignment_points", "alignment_anchors", "reference_points"):
-            if key in data:
-                raw_points = data[key]
-                break
+        raw_points = self.raw_alignment_points_from_data(data)
         if raw_points is None:
             return []
         if not isinstance(raw_points, list):
@@ -3262,20 +3717,33 @@ class MainWindow(QMainWindow):
 
         points: list[tuple[float, float]] = []
         for index, point in enumerate(raw_points, start=1):
-            if isinstance(point, dict):
-                x = float(point["x"])
-                y = float(point["y"])
-            elif isinstance(point, list) and len(point) >= 2:
-                x = float(point[0])
-                y = float(point[1])
-            else:
-                raise ValueError(f"alignment point {index} is invalid")
+            if isinstance(point, dict) and "nominal" in point:
+                point = point["nominal"]
+            try:
+                x, y = self.parse_xy_pair(point)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"alignment point {index} is invalid") from exc
             if not math.isfinite(x) or not math.isfinite(y):
                 raise ValueError(
                     f"alignment point {index} contains non-finite values"
                 )
             points.append((x, y))
         return points
+
+    def raw_alignment_points_from_data(self, data):
+        for key in ("alignment_points", "alignment_anchors", "reference_points"):
+            if key in data:
+                return data[key]
+        return []
+
+    def parse_xy_pair(self, point) -> tuple[float, float]:
+        if isinstance(point, dict):
+            return float(point["x"]), float(point["y"])
+        if isinstance(point, list) and len(point) >= 2:
+            return float(point[0]), float(point[1])
+        if isinstance(point, tuple) and len(point) >= 2:
+            return float(point[0]), float(point[1])
+        raise ValueError("expected x/y pair")
 
     def parse_pattern_file(self, path: Path) -> list[tuple[float, float]]:
         if path.suffix.lower() == ".json":
@@ -3325,11 +3793,16 @@ class MainWindow(QMainWindow):
         return points
 
     def initialize_pattern_transform_to_visible_bottom_left(self) -> None:
-        self.pattern_work_offset_x, self.pattern_work_offset_y = (
-            self.stage_view.visible_stage_bottom_left()
+        offset_x, offset_y = self.stage_view.visible_stage_bottom_left()
+        self.set_pattern_transform_matrix(
+            -1.0,
+            0.0,
+            0.0,
+            -1.0,
+            offset_x,
+            offset_y,
+            update_display=False,
         )
-        self.pattern_rotation_deg = 0.0
-        self.pattern_scale = 1.0
         self.update_pattern_display()
 
     def reset_pattern_alignment(self) -> None:
@@ -3339,6 +3812,9 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_pending_index = None
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
+        self.pattern_alignment_current_index = 0
+        self.pattern_alignment_measurements = []
+        self.pattern_alignment_completed = False
         self.clear_pattern_alignment_reference_points()
         self.stage_view.set_pattern_selection_enabled(False)
         self.stage_view.set_selected_pattern_index(None)
@@ -3348,6 +3824,7 @@ class MainWindow(QMainWindow):
             self.pattern_status_label.setText("Reset to visible bottom-left")
         else:
             self.pattern_status_label.setText("No pattern")
+        self.update_control_states()
 
     def update_pattern_display(self) -> None:
         if not hasattr(self, "pattern_stats_label"):
@@ -3375,9 +3852,16 @@ class MainWindow(QMainWindow):
         return (
             f"Offset: X{self.pattern_work_offset_x:.3f} "
             f"Y{self.pattern_work_offset_y:.3f}\n"
+            "Matrix:\n"
+            f"[{self.pattern_transform_a11:.6f} "
+            f"{self.pattern_transform_a12:.6f}]\n"
+            f"[{self.pattern_transform_a21:.6f} "
+            f"{self.pattern_transform_a22:.6f}]\n"
             f"Rotation: {self.pattern_rotation_deg:.3f} deg\n"
-            f"Scale: {self.pattern_scale:.5f} "
-            f"({self.pattern_scale * 100.0:.2f}%)"
+            f"Scale: X{self.pattern_scale_x:.5f} "
+            f"Y{self.pattern_scale_y:.5f}\n"
+            f"Orthogonality error: "
+            f"{self.pattern_orthogonality_error_deg:.3f} deg"
         )
 
     def transformed_pattern_points(self) -> list[tuple[int, float, float]]:
@@ -3395,10 +3879,20 @@ class MainWindow(QMainWindow):
     def transformed_pattern_alignment_reference_positions(
         self,
     ) -> list[tuple[float, float]]:
-        return [
+        positions: list[tuple[float, float]] = []
+        if self.pattern_alignment_measurements:
+            positions.extend(
+                (stage_x, stage_y)
+                for _nominal_x, _nominal_y, stage_x, stage_y
+                in self.pattern_alignment_measurements
+            )
+        positions.extend(
             self.pattern_point_to_stage(point)
-            for point in self.pattern_alignment_reference_points
-        ]
+            for point in self.pattern_alignment_reference_points[
+                len(self.pattern_alignment_measurements):
+            ]
+        )
+        return positions
 
     def set_leveling_work_area_to_aligned_pattern_bounds(self) -> None:
         positions = (
@@ -3415,10 +3909,15 @@ class MainWindow(QMainWindow):
 
         xs = [x for x, _y in positions]
         ys = [y for _x, y in positions]
-        x_min = min(xs) - DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM
-        x_max = max(xs) + DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM
-        y_min = min(ys) - DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM
-        y_max = max(ys) + DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM
+        margin = (
+            self.auto_height_map_margin_mm
+            if self.auto_height_map_margin_enabled
+            else 0.0
+        )
+        x_min = min(xs) - margin
+        x_max = max(xs) + margin
+        y_min = min(ys) - margin
+        y_max = max(ys) + margin
         width = max(MIN_WORK_AREA_SIZE_MM, x_max - x_min)
         height = max(MIN_WORK_AREA_SIZE_MM, y_max - y_min)
         center_x = (x_min + x_max) / 2.0
@@ -3429,9 +3928,14 @@ class MainWindow(QMainWindow):
             width,
             height,
         )
+        margin_text = (
+            f"with {margin:g} mm margin"
+            if margin > 0.0
+            else "without margin"
+        )
         self.append_log(
             "# auto leveling work area set from aligned pattern "
-            f"with {DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM:g} mm margin"
+            f"{margin_text}"
         )
 
     def set_pattern_alignment_reference_points(
@@ -3442,6 +3946,7 @@ class MainWindow(QMainWindow):
 
     def clear_pattern_alignment_reference_points(self) -> None:
         self.pattern_alignment_reference_points = []
+        self.pattern_alignment_measurements = []
         if hasattr(self, "stage_view"):
             self.stage_view.set_pattern_alignment_points([])
         self.update_pcs_axis_display()
@@ -3467,22 +3972,88 @@ class MainWindow(QMainWindow):
 
     def pattern_point_to_stage(self, point: tuple[float, float]) -> tuple[float, float]:
         x, y = point
-        flipped_x = -x * self.pattern_scale
-        flipped_y = -y * self.pattern_scale
-        radians = math.radians(self.pattern_rotation_deg)
-        cos_theta = math.cos(radians)
-        sin_theta = math.sin(radians)
         stage_x = (
             self.pattern_work_offset_x
-            + cos_theta * flipped_x
-            - sin_theta * flipped_y
+            + self.pattern_transform_a11 * x
+            + self.pattern_transform_a12 * y
         )
         stage_y = (
             self.pattern_work_offset_y
-            + sin_theta * flipped_x
-            + cos_theta * flipped_y
+            + self.pattern_transform_a21 * x
+            + self.pattern_transform_a22 * y
         )
         return stage_x, stage_y
+
+    def set_pattern_transform_matrix(
+        self,
+        a11: float,
+        a12: float,
+        a21: float,
+        a22: float,
+        offset_x: float,
+        offset_y: float,
+        *,
+        update_display: bool = True,
+    ) -> None:
+        self.pattern_transform_a11 = a11
+        self.pattern_transform_a12 = a12
+        self.pattern_transform_a21 = a21
+        self.pattern_transform_a22 = a22
+        self.pattern_work_offset_x = offset_x
+        self.pattern_work_offset_y = offset_y
+        self.update_pattern_transform_metrics()
+        if update_display:
+            self.update_pattern_display()
+
+    def update_pattern_transform_metrics(self) -> None:
+        self.pattern_scale_x = math.hypot(
+            self.pattern_transform_a11,
+            self.pattern_transform_a21,
+        )
+        self.pattern_scale_y = math.hypot(
+            self.pattern_transform_a12,
+            self.pattern_transform_a22,
+        )
+        self.pattern_scale = (self.pattern_scale_x + self.pattern_scale_y) / 2.0
+        if self.pattern_scale_x > 1e-12:
+            self.pattern_rotation_deg = math.degrees(
+                math.atan2(
+                    -self.pattern_transform_a21,
+                    -self.pattern_transform_a11,
+                )
+            )
+        else:
+            self.pattern_rotation_deg = 0.0
+
+        if self.pattern_scale_x > 1e-12 and self.pattern_scale_y > 1e-12:
+            dot = (
+                self.pattern_transform_a11 * self.pattern_transform_a12
+                + self.pattern_transform_a21 * self.pattern_transform_a22
+            )
+            cosine = clamp(
+                dot / (self.pattern_scale_x * self.pattern_scale_y),
+                -1.0,
+                1.0,
+            )
+            angle = math.degrees(math.acos(cosine))
+            self.pattern_orthogonality_error_deg = angle - 90.0
+        else:
+            self.pattern_orthogonality_error_deg = 0.0
+
+    def similarity_matrix_from_rotation_scale(
+        self,
+        rotation_deg: float,
+        scale: float,
+    ) -> tuple[float, float, float, float]:
+        radians = math.radians(rotation_deg)
+        cos_theta = math.cos(radians)
+        sin_theta = math.sin(radians)
+        return (
+            -scale * cos_theta,
+            scale * sin_theta,
+            -scale * sin_theta,
+            -scale * cos_theta,
+        )
 
     def set_pattern_transform_from_alignment(
         self,
@@ -3511,51 +4082,187 @@ class MainWindow(QMainWindow):
         second_point: tuple[float, float] | None = None,
         second_stage: tuple[float, float] | None = None,
     ) -> None:
-        should_warn_scale = False
+        measurements = [
+            (first_point[0], first_point[1], first_stage[0], first_stage[1])
+        ]
         if second_point is not None and second_stage is not None:
-            first_flipped = (-first_point[0], -first_point[1])
-            second_flipped = (-second_point[0], -second_point[1])
-            pattern_dx = second_flipped[0] - first_flipped[0]
-            pattern_dy = second_flipped[1] - first_flipped[1]
-            stage_dx = second_stage[0] - first_stage[0]
-            stage_dy = second_stage[1] - first_stage[1]
-            pattern_distance = math.hypot(pattern_dx, pattern_dy)
-            stage_distance = math.hypot(stage_dx, stage_dy)
-            if pattern_distance > 1e-9 and stage_distance > 1e-9:
-                self.pattern_scale = stage_distance / pattern_distance
-                self.pattern_rotation_deg = math.degrees(
-                    math.atan2(stage_dy, stage_dx)
-                    - math.atan2(pattern_dy, pattern_dx)
-                )
-                should_warn_scale = abs(self.pattern_scale - 1.0) > 0.02
+            measurements.append(
+                (second_point[0], second_point[1], second_stage[0], second_stage[1])
+            )
+        self.apply_pattern_transform_from_measurements(
+            measurements,
+            warn_on_scale=True,
+        )
 
-        rotated_first = self.rotate_flipped_pattern_point(first_point)
-        self.pattern_work_offset_x = first_stage[0] - rotated_first[0]
-        self.pattern_work_offset_y = first_stage[1] - rotated_first[1]
-        self.update_pattern_display()
-        if should_warn_scale:
+    def apply_pattern_transform_from_measurements(
+        self,
+        measurements: list[tuple[float, float, float, float]],
+        *,
+        warn_on_scale: bool = False,
+    ) -> bool:
+        if not measurements:
+            return False
+        try:
+            if len(measurements) == 1:
+                a11 = self.pattern_transform_a11
+                a12 = self.pattern_transform_a12
+                a21 = self.pattern_transform_a21
+                a22 = self.pattern_transform_a22
+                nominal_x, nominal_y, stage_x, stage_y = measurements[0]
+                offset_x = stage_x - (a11 * nominal_x + a12 * nominal_y)
+                offset_y = stage_y - (a21 * nominal_x + a22 * nominal_y)
+            elif len(measurements) == 2:
+                a11, a12, a21, a22, offset_x, offset_y = (
+                    self.fit_similarity_transform(measurements)
+                )
+            else:
+                a11, a12, a21, a22, offset_x, offset_y = (
+                    self.fit_affine_transform(measurements)
+                )
+        except ValueError as exc:
+            self.append_log(f"! alignment transform failed: {exc}")
             QMessageBox.warning(
                 self,
-                "Pattern Scale Warning",
-                (
-                    f"Measured pattern scale is {self.pattern_scale:.5f} "
-                    f"({self.pattern_scale * 100.0:.2f}%).\n\n"
-                    "This differs from nominal by more than 2%."
-                ),
+                "Alignment Failed",
+                f"Could not fit the alignment transform:\n{exc}",
                 QMessageBox.StandardButton.Ok,
             )
+            return False
+
+        self.set_pattern_transform_matrix(
+            a11,
+            a12,
+            a21,
+            a22,
+            offset_x,
+            offset_y,
+        )
+        if warn_on_scale:
+            self.warn_if_pattern_scale_deviation()
+        return True
+
+    def fit_similarity_transform(
+        self,
+        measurements: list[tuple[float, float, float, float]],
+    ) -> tuple[float, float, float, float, float, float]:
+        first_x, first_y, first_stage_x, first_stage_y = measurements[0]
+        second_x, second_y, second_stage_x, second_stage_y = measurements[1]
+        first_point = (first_x, first_y)
+        second_point = (second_x, second_y)
+        first_stage = (first_stage_x, first_stage_y)
+        second_stage = (second_stage_x, second_stage_y)
+
+        first_flipped = (-first_point[0], -first_point[1])
+        second_flipped = (-second_point[0], -second_point[1])
+        pattern_dx = second_flipped[0] - first_flipped[0]
+        pattern_dy = second_flipped[1] - first_flipped[1]
+        stage_dx = second_stage[0] - first_stage[0]
+        stage_dy = second_stage[1] - first_stage[1]
+        pattern_distance = math.hypot(pattern_dx, pattern_dy)
+        stage_distance = math.hypot(stage_dx, stage_dy)
+        if pattern_distance <= 1e-9 or stage_distance <= 1e-9:
+            raise ValueError("alignment points must be distinct")
+        scale = stage_distance / pattern_distance
+        rotation_deg = math.degrees(
+            math.atan2(stage_dy, stage_dx)
+            - math.atan2(pattern_dy, pattern_dx)
+        )
+        a11, a12, a21, a22 = self.similarity_matrix_from_rotation_scale(
+            rotation_deg,
+            scale,
+        )
+        offset_x = first_stage[0] - (a11 * first_point[0] + a12 * first_point[1])
+        offset_y = first_stage[1] - (a21 * first_point[0] + a22 * first_point[1])
+        return a11, a12, a21, a22, offset_x, offset_y
+
+    def fit_affine_transform(
+        self,
+        measurements: list[tuple[float, float, float, float]],
+    ) -> tuple[float, float, float, float, float, float]:
+        normal = [[0.0, 0.0, 0.0] for _row in range(3)]
+        rhs_x = [0.0, 0.0, 0.0]
+        rhs_y = [0.0, 0.0, 0.0]
+        for nominal_x, nominal_y, stage_x, stage_y in measurements:
+            row = (nominal_x, nominal_y, 1.0)
+            for outer in range(3):
+                rhs_x[outer] += row[outer] * stage_x
+                rhs_y[outer] += row[outer] * stage_y
+                for inner in range(3):
+                    normal[outer][inner] += row[outer] * row[inner]
+
+        coeff_x = self.solve_3x3(normal, rhs_x)
+        coeff_y = self.solve_3x3(normal, rhs_y)
+        return (
+            coeff_x[0],
+            coeff_x[1],
+            coeff_y[0],
+            coeff_y[1],
+            coeff_x[2],
+            coeff_y[2],
+        )
+
+    def solve_3x3(
+        self,
+        matrix: list[list[float]],
+        vector: list[float],
+    ) -> tuple[float, float, float]:
+        augmented = [
+            [matrix[row][0], matrix[row][1], matrix[row][2], vector[row]]
+            for row in range(3)
+        ]
+        for column in range(3):
+            pivot_row = max(
+                range(column, 3),
+                key=lambda row: abs(augmented[row][column]),
+            )
+            pivot = augmented[pivot_row][column]
+            if abs(pivot) <= 1e-12:
+                raise ValueError(
+                    "alignment points are degenerate; choose non-collinear anchors"
+                )
+            if pivot_row != column:
+                augmented[column], augmented[pivot_row] = (
+                    augmented[pivot_row],
+                    augmented[column],
+                )
+            pivot = augmented[column][column]
+            for item in range(column, 4):
+                augmented[column][item] /= pivot
+            for row in range(3):
+                if row == column:
+                    continue
+                factor = augmented[row][column]
+                for item in range(column, 4):
+                    augmented[row][item] -= factor * augmented[column][item]
+        return augmented[0][3], augmented[1][3], augmented[2][3]
+
+    def warn_if_pattern_scale_deviation(self) -> None:
+        max_deviation = max(
+            abs(self.pattern_scale_x - 1.0),
+            abs(self.pattern_scale_y - 1.0),
+        )
+        if max_deviation <= 0.02:
+            return
+        QMessageBox.warning(
+            self,
+            "Pattern Scale Warning",
+            (
+                "Measured pattern scale differs from nominal by more than 2%.\n\n"
+                f"Scale X: {self.pattern_scale_x:.5f} "
+                f"({self.pattern_scale_x * 100.0:.2f}%)\n"
+                f"Scale Y: {self.pattern_scale_y:.5f} "
+                f"({self.pattern_scale_y * 100.0:.2f}%)"
+            ),
+            QMessageBox.StandardButton.Ok,
+        )
 
     def rotate_flipped_pattern_point(
         self, point: tuple[float, float]
     ) -> tuple[float, float]:
-        flipped_x = -point[0] * self.pattern_scale
-        flipped_y = -point[1] * self.pattern_scale
-        radians = math.radians(self.pattern_rotation_deg)
-        cos_theta = math.cos(radians)
-        sin_theta = math.sin(radians)
+        x, y = point
         return (
-            cos_theta * flipped_x - sin_theta * flipped_y,
-            sin_theta * flipped_x + cos_theta * flipped_y,
+            self.pattern_transform_a11 * x + self.pattern_transform_a12 * y,
+            self.pattern_transform_a21 * x + self.pattern_transform_a22 * y,
         )
 
     def reset_pattern_print_progress(self) -> None:
@@ -3690,7 +4397,7 @@ class MainWindow(QMainWindow):
             and not self.printing_active
         )
         homed_motion_allowed = can_issue and self.all_axes_homed
-        has_height_map = bool(self.height_map_points)
+        has_height_map = self.height_map_completed and bool(self.height_map_points)
         has_pattern = bool(self.pattern_points)
 
         self.connect_button.setEnabled(not connected)
@@ -3795,6 +4502,7 @@ class MainWindow(QMainWindow):
                 self.pattern_kick_spin,
                 self.pattern_retract_spin,
                 self.pattern_travel_height_spin,
+                self.pattern_lifting_speed_spin,
             ):
                 widget.setEnabled(pattern_idle)
         if hasattr(self, "stage_view"):
@@ -3806,6 +4514,26 @@ class MainWindow(QMainWindow):
                 self.stage_view.set_work_area_edit_enabled(
                     not self.height_map_active and not self.printing_active
                 )
+        self.update_workflow_statuses()
+
+    def update_workflow_statuses(self) -> None:
+        if not hasattr(self, "workflow_status_labels"):
+            return
+        tool_type = (self.current_tool_type or "").strip().lower()
+        states = {
+            "connected": self.serial_connected,
+            "homed": self.all_axes_homed,
+            "height_map": self.height_map_completed and bool(self.height_map_points),
+            "aligned": self.pattern_alignment_completed,
+            "pattern": bool(self.pattern_points),
+            "dispenser": bool(tool_type and tool_type not in {"none", "probe"}),
+        }
+        for key, label in self.workflow_status_labels.items():
+            label.setStyleSheet(
+                WORKFLOW_COMPLETE_STYLE
+                if states.get(key, False)
+                else WORKFLOW_PENDING_STYLE
+            )
 
     def pattern_print_tooltip(
         self,
@@ -3826,7 +4554,7 @@ class MainWindow(QMainWindow):
         if not has_pattern:
             reasons.append("Load a pattern file.")
         if not has_height_map:
-            reasons.append("Create or load a height map.")
+            reasons.append("Create or load a completed height map.")
         if self.print_circle_editing:
             reasons.append("Finish or cancel circle editing.")
         if self.pattern_alignment_state is not None:
@@ -3988,31 +4716,50 @@ class MainWindow(QMainWindow):
         else:
             self.cancel_pattern_alignment("Alignment cancelled")
 
+    def configured_alignment_point_count(self) -> int:
+        return 4 if self.use_four_point_alignment else 2
+
+    def alignment_required_point_count(self) -> int:
+        if (
+            self.pattern_alignment_state is not None
+            or self.pattern_alignment_mode is not None
+        ):
+            return self.pattern_alignment_point_count
+        return self.configured_alignment_point_count()
+
     def begin_pattern_alignment(self) -> None:
         if not self.ensure_pattern_alignment_can_start():
             return
 
         self.pattern_alignment_mode = "click"
+        self.pattern_alignment_point_count = self.configured_alignment_point_count()
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
+        self.pattern_alignment_current_index = 0
+        self.pattern_alignment_measurements = []
+        self.pattern_alignment_completed = False
         self.clear_pattern_alignment_reference_points()
         self.open_alignment_procedure_dialog("click")
         self.pattern_alignment_first = None
         self.pattern_alignment_pending_index = None
-        self.set_pattern_alignment_state("select_first")
+        self.set_pattern_alignment_state("select_point")
         self.stage_view.set_pattern_selection_enabled(True)
         self.stage_view.set_selected_pattern_index(None)
-        self.pattern_status_label.setText("Click first pattern point")
+        self.pattern_status_label.setText("Click pattern point 1")
 
     def begin_anchor_pattern_alignment(self) -> None:
         if not self.ensure_anchor_alignment_can_start():
             return
 
         self.pattern_alignment_mode = "anchors"
+        self.pattern_alignment_point_count = self.configured_alignment_point_count()
         self.pattern_alignment_first = None
         self.pattern_alignment_pending_index = None
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
+        self.pattern_alignment_current_index = 0
+        self.pattern_alignment_measurements = []
+        self.pattern_alignment_completed = False
         self.clear_pattern_alignment_reference_points()
         self.open_alignment_procedure_dialog("anchors")
         self.set_pattern_alignment_state("anchor_setup")
@@ -4026,6 +4773,17 @@ class MainWindow(QMainWindow):
                 self,
                 "No Pattern",
                 "Load a pattern before alignment.",
+                QMessageBox.StandardButton.Ok,
+            )
+            return False
+        if len(self.pattern_points) < self.alignment_required_point_count():
+            QMessageBox.warning(
+                self,
+                "Not Enough Pattern Points",
+                (
+                    "The current alignment mode needs "
+                    f"{self.alignment_required_point_count()} pattern points."
+                ),
                 QMessageBox.StandardButton.Ok,
             )
             return False
@@ -4064,6 +4822,7 @@ class MainWindow(QMainWindow):
             self,
             mode,
             self.default_anchor_points(),
+            self.alignment_required_point_count(),
             self.pattern_alignment_height,
             self.alignment_coarse_xy_step,
             self.alignment_fine_xy_step,
@@ -4090,18 +4849,61 @@ class MainWindow(QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
 
-    def default_anchor_points(self) -> tuple[tuple[float, float], tuple[float, float]]:
+    def default_anchor_points(self) -> list[tuple[float, float]]:
+        required = self.alignment_required_point_count()
+        defaults: list[tuple[float, float]] = []
         if self.pattern_anchor_defaults is not None:
-            return self.pattern_anchor_defaults
+            defaults = list(self.pattern_anchor_defaults[:required])
         if not self.pattern_points:
-            return ((0.0, 0.0), (10.0, 0.0))
+            fallback = [
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (10.0, 10.0),
+                (0.0, 10.0),
+            ]
+            return (defaults + fallback[len(defaults):])[:required]
         xs = [x for x, _y in self.pattern_points]
         ys = [y for _x, y in self.pattern_points]
-        first = (min(xs), min(ys))
-        second = (max(xs), max(ys))
-        if math.hypot(second[0] - first[0], second[1] - first[1]) <= 1e-9:
-            second = (first[0] + 10.0, first[1])
-        return first, second
+        x_min = min(xs)
+        x_max = max(xs)
+        y_min = min(ys)
+        y_max = max(ys)
+        generated = [
+            (x_min, y_min),
+            (x_max, y_max),
+            (x_max, y_min),
+            (x_min, y_max),
+        ]
+        if math.hypot(x_max - x_min, y_max - y_min) <= 1e-9:
+            generated = [
+                (x_min, y_min),
+                (x_min + 10.0, y_min),
+                (x_min + 10.0, y_min + 10.0),
+                (x_min, y_min + 10.0),
+            ]
+        return (defaults + generated[len(defaults):])[:required]
+
+    def validate_nominal_alignment_points(
+        self,
+        points: list[tuple[float, float]],
+    ) -> bool:
+        if len(points) < 2:
+            return len(points) == 1
+        first = points[0]
+        if all(
+            math.hypot(point[0] - first[0], point[1] - first[1]) <= 1e-9
+            for point in points[1:]
+        ):
+            return False
+        if len(points) < 3:
+            return True
+        try:
+            self.fit_affine_transform(
+                [(x, y, x, y) for x, y in points]
+            )
+        except ValueError:
+            return False
+        return True
 
     def on_alignment_dialog_finished(self, _result: int = 0) -> None:
         if self.alignment_procedure_dialog is None:
@@ -4114,9 +4916,9 @@ class MainWindow(QMainWindow):
         state = self.pattern_alignment_state
         if state == "anchor_setup":
             self.start_anchor_alignment_from_dialog()
-        elif state in {"move_first", "move_second", "anchor_move_first", "anchor_move_second"}:
+        elif state in {"move_point", "anchor_move"}:
             self.lower_to_pattern_alignment_height()
-        elif state in {"fine_first", "fine_second", "anchor_fine_first", "anchor_fine_second"}:
+        elif state in {"fine_point", "anchor_fine"}:
             self.confirm_pattern_alignment_point()
         elif state is None and self.alignment_procedure_dialog is not None:
             self.alignment_procedure_dialog.close()
@@ -4131,25 +4933,37 @@ class MainWindow(QMainWindow):
             self.alignment_procedure_dialog.coarse_xy_step(),
             self.alignment_procedure_dialog.fine_xy_step(),
         )
-        first, second = anchor_points
-        if math.hypot(second[0] - first[0], second[1] - first[1]) <= 1e-9:
+        required = self.alignment_required_point_count()
+        if len(anchor_points) < required:
             QMessageBox.warning(
                 self,
                 "Invalid Anchors",
-                "Anchor 1 and Anchor 2 must be different points.",
+                f"Enter {required} anchor positions.",
+                QMessageBox.StandardButton.Ok,
+            )
+            return
+        anchor_points = anchor_points[:required]
+        if not self.validate_nominal_alignment_points(anchor_points):
+            QMessageBox.warning(
+                self,
+                "Invalid Anchors",
+                "Choose distinct, non-collinear anchor positions.",
                 QMessageBox.StandardButton.Ok,
             )
             return
 
         self.pattern_alignment_anchor_points = anchor_points
         self.pattern_alignment_anchor_first = None
+        self.pattern_alignment_current_index = 0
+        self.pattern_alignment_measurements = []
+        self.set_pattern_alignment_reference_points(anchor_points)
         self.alignment_procedure_dialog.set_anchor_inputs_enabled(False)
         if not self.send_synchronized_motion(
             *self.alignment_safe_z_payloads(),
             require_homed=False,
         ):
             return
-        self.set_pattern_alignment_state("anchor_move_first")
+        self.set_pattern_alignment_state("anchor_move")
         self.pattern_status_label.setText("Go to anchor 1, then Lower Z")
 
     def update_alignment_dialog_for_state(self) -> None:
@@ -4158,62 +4972,60 @@ class MainWindow(QMainWindow):
             return
 
         state = self.pattern_alignment_state
-        step_map = {
-            "select_first": 0,
-            "move_first": 1,
-            "fine_first": 2,
-            "select_second": 3,
-            "move_second": 4,
-            "fine_second": 5,
-            "anchor_setup": 0,
-            "anchor_move_first": 0,
-            "anchor_fine_first": 1,
-            "anchor_move_second": 2,
-            "anchor_fine_second": 3,
-        }
-        action_map = {
-            "select_first": ("Select on Stage", False),
-            "select_second": ("Select on Stage", False),
-            "move_first": ("Lower Z", True),
-            "move_second": ("Lower Z", True),
-            "fine_first": ("Confirm 1", True),
-            "fine_second": ("Confirm 2", True),
-            "anchor_setup": ("Start", True),
-            "anchor_move_first": ("Lower Z", True),
-            "anchor_move_second": ("Lower Z", True),
-            "anchor_fine_first": ("Confirm 1", True),
-            "anchor_fine_second": ("Confirm 2", True),
-            None: ("Close", True),
-        }
-        status_map = {
-            "select_first": "Click the first pattern dot on the stage view.",
-            "move_first": "Move to the physical counterpart of point 1, then lower Z.",
-            "fine_first": "Use the cameras and XY jog buttons, then confirm point 1.",
-            "select_second": "Click the second pattern dot on the stage view.",
-            "move_second": "Rough move queued for point 2. Adjust XY if needed, then lower Z.",
-            "fine_second": "Use the cameras and XY jog buttons, then confirm point 2.",
-            "anchor_setup": "Enter two anchor positions in pattern coordinates, then start.",
-            "anchor_move_first": "Move to physical anchor 1, then lower Z.",
-            "anchor_fine_first": "Use the cameras and XY jog buttons, then confirm anchor 1.",
-            "anchor_move_second": "Rough move queued for anchor 2. Adjust XY if needed, then lower Z.",
-            "anchor_fine_second": "Use the cameras and XY jog buttons, then confirm anchor 2.",
-            None: "Alignment complete.",
-        }
-        dialog.set_current_step(step_map.get(state))
+        label = ALIGNMENT_POINT_LABELS[
+            min(self.pattern_alignment_current_index, len(ALIGNMENT_POINT_LABELS) - 1)
+        ]
+        step_index = None
+        action_text = "Close"
+        action_enabled = True
+        status = "Alignment complete."
+        if state == "select_point":
+            step_index = self.pattern_alignment_current_index * 3
+            action_text = "Select on Stage"
+            action_enabled = False
+            status = f"Click pattern dot {label} on the stage view."
+        elif state == "move_point":
+            step_index = self.pattern_alignment_current_index * 3 + 1
+            action_text = "Lower Z"
+            status = (
+                f"Move to the physical counterpart of point {label}, "
+                "then lower Z."
+            )
+        elif state == "fine_point":
+            step_index = self.pattern_alignment_current_index * 3 + 2
+            action_text = f"Confirm {label}"
+            status = (
+                "Use the cameras and XY jog buttons, "
+                f"then confirm point {label}."
+            )
+        elif state == "anchor_setup":
+            step_index = 0
+            action_text = "Start"
+            status = (
+                f"Enter {self.alignment_required_point_count()} anchor positions "
+                "in pattern coordinates, then start."
+            )
+        elif state == "anchor_move":
+            step_index = self.pattern_alignment_current_index * 2
+            action_text = "Lower Z"
+            status = f"Move to physical anchor {label}, then lower Z."
+        elif state == "anchor_fine":
+            step_index = self.pattern_alignment_current_index * 2 + 1
+            action_text = f"Confirm {label}"
+            status = (
+                "Use the cameras and XY jog buttons, "
+                f"then confirm anchor {label}."
+            )
+
+        dialog.set_current_step(step_index)
         dialog.set_jog_step_mode(self.alignment_state_uses_fine_step(state))
-        action_text, action_enabled = action_map.get(state, ("Close", True))
         dialog.set_primary_action(action_text, action_enabled)
-        dialog.set_status(status_map.get(state, ""))
+        dialog.set_status(status)
         if state != "anchor_setup":
             dialog.set_anchor_inputs_enabled(False)
 
     def alignment_state_uses_fine_step(self, state: str | None) -> bool:
-        return state in {
-            "fine_first",
-            "fine_second",
-            "anchor_fine_first",
-            "anchor_fine_second",
-        }
+        return state in {"fine_point", "anchor_fine"}
 
     def cancel_pattern_alignment(self, status: str) -> None:
         self.raise_to_max_z_after_alignment()
@@ -4223,6 +5035,9 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_first = None
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
+        self.pattern_alignment_current_index = 0
+        self.pattern_alignment_measurements = []
+        self.pattern_alignment_completed = False
         self.clear_pattern_alignment_reference_points()
         self.stage_view.set_pattern_selection_enabled(False)
         self.stage_view.set_selected_pattern_index(None)
@@ -4238,17 +5053,12 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_state = state
         button_text = {
             None: "Click && Align",
-            "select_first": "Cancel Align",
-            "select_second": "Cancel Align",
-            "move_first": "Lower Z",
-            "move_second": "Lower Z",
-            "fine_first": "Confirm 1",
-            "fine_second": "Confirm 2",
+            "select_point": "Cancel Align",
+            "move_point": "Cancel Align",
+            "fine_point": "Cancel Align",
             "anchor_setup": "Cancel Align",
-            "anchor_move_first": "Cancel Align",
-            "anchor_move_second": "Cancel Align",
-            "anchor_fine_first": "Cancel Align",
-            "anchor_fine_second": "Cancel Align",
+            "anchor_move": "Cancel Align",
+            "anchor_fine": "Cancel Align",
         }.get(state, "Click && Align")
         self.pattern_align_button.setText(button_text)
         self.update_alignment_dialog_for_state()
@@ -4257,40 +5067,44 @@ class MainWindow(QMainWindow):
     def on_pattern_point_selected(self, point_index: int) -> None:
         if self.pattern_alignment_mode != "click":
             return
-        if self.pattern_alignment_state == "select_first":
-            self.set_pattern_alignment_reference_points(
-                [self.pattern_points[point_index]]
-            )
-            self.pattern_alignment_pending_index = point_index
-            self.stage_view.set_pattern_selection_enabled(False)
-            self.raise_for_first_pattern_alignment_point(point_index)
-        elif self.pattern_alignment_state == "select_second":
-            reference_points: list[tuple[float, float]] = []
-            if self.pattern_alignment_first is not None:
-                reference_points.append(
-                    (
-                        self.pattern_alignment_first[1],
-                        self.pattern_alignment_first[2],
-                    )
-                )
-            reference_points.append(self.pattern_points[point_index])
-            self.set_pattern_alignment_reference_points(reference_points)
-            self.pattern_alignment_pending_index = point_index
-            self.stage_view.set_pattern_selection_enabled(False)
-            self.move_to_second_pattern_alignment_point(point_index)
+        if self.pattern_alignment_state != "select_point":
+            return
 
-    def raise_for_first_pattern_alignment_point(self, point_index: int) -> None:
+        point = self.pattern_points[point_index]
+        reference_points = [
+            (nominal_x, nominal_y)
+            for nominal_x, nominal_y, _stage_x, _stage_y
+            in self.pattern_alignment_measurements
+        ]
+        reference_points.append(point)
+        if not self.validate_nominal_alignment_points(reference_points):
+            QMessageBox.warning(
+                self,
+                "Invalid Alignment Point",
+                "Choose distinct, non-collinear alignment points.",
+                QMessageBox.StandardButton.Ok,
+            )
+            return
+        self.set_pattern_alignment_reference_points(reference_points)
+        self.pattern_alignment_pending_index = point_index
+        self.stage_view.set_pattern_selection_enabled(False)
+        if self.pattern_alignment_current_index == 0:
+            self.raise_for_pattern_alignment_point(point_index)
+        else:
+            self.move_to_pattern_alignment_point(point_index)
+
+    def raise_for_pattern_alignment_point(self, point_index: int) -> None:
         if not self.send_synchronized_motion(
             *self.alignment_safe_z_payloads(),
             require_homed=False,
         ):
             return
-        self.set_pattern_alignment_state("move_first")
+        self.set_pattern_alignment_state("move_point")
         self.pattern_status_label.setText(
             f"Move to physical point {point_index + 1}, then Lower Z"
         )
 
-    def move_to_second_pattern_alignment_point(self, point_index: int) -> None:
+    def move_to_pattern_alignment_point(self, point_index: int) -> None:
         rough_x, rough_y = self.pattern_point_to_stage(self.pattern_points[point_index])
         if not self.send_synchronized_motion(
             *self.alignment_safe_z_payloads(),
@@ -4298,7 +5112,7 @@ class MainWindow(QMainWindow):
             require_homed=False,
         ):
             return
-        self.set_pattern_alignment_state("move_second")
+        self.set_pattern_alignment_state("move_point")
         self.pattern_status_label.setText(
             f"Rough moving to point {point_index + 1}; then Lower Z"
         )
@@ -4335,18 +5149,17 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        if self.pattern_alignment_state == "move_first":
-            self.set_pattern_alignment_state("fine_first")
-            self.pattern_status_label.setText("Fine-align point 1, then Confirm 1")
-        elif self.pattern_alignment_state == "move_second":
-            self.set_pattern_alignment_state("fine_second")
-            self.pattern_status_label.setText("Fine-align point 2, then Confirm 2")
-        elif self.pattern_alignment_state == "anchor_move_first":
-            self.set_pattern_alignment_state("anchor_fine_first")
-            self.pattern_status_label.setText("Fine-align anchor 1, then Confirm 1")
-        elif self.pattern_alignment_state == "anchor_move_second":
-            self.set_pattern_alignment_state("anchor_fine_second")
-            self.pattern_status_label.setText("Fine-align anchor 2, then Confirm 2")
+        label = ALIGNMENT_POINT_LABELS[self.pattern_alignment_current_index]
+        if self.pattern_alignment_state == "move_point":
+            self.set_pattern_alignment_state("fine_point")
+            self.pattern_status_label.setText(
+                f"Fine-align point {label}, then Confirm {label}"
+            )
+        elif self.pattern_alignment_state == "anchor_move":
+            self.set_pattern_alignment_state("anchor_fine")
+            self.pattern_status_label.setText(
+                f"Fine-align anchor {label}, then Confirm {label}"
+            )
 
     def confirm_pattern_alignment_point(self) -> None:
         if self.current_x is None or self.current_y is None:
@@ -4357,7 +5170,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Ok,
             )
             return
-        if self.pattern_alignment_state in {"anchor_fine_first", "anchor_fine_second"}:
+        if self.pattern_alignment_state == "anchor_fine":
             self.confirm_anchor_alignment_point((self.current_x, self.current_y))
             return
         if self.pattern_alignment_pending_index is None:
@@ -4366,37 +5179,25 @@ class MainWindow(QMainWindow):
 
         point_index = self.pattern_alignment_pending_index
         stage_position = (self.current_x, self.current_y)
-        if self.pattern_alignment_state == "fine_first":
-            point = self.pattern_points[point_index]
-            self.pattern_alignment_first = (
-                point_index,
-                point[0],
-                point[1],
-                stage_position[0],
-                stage_position[1],
-            )
-            self.set_pattern_transform_from_alignment(point_index, stage_position)
-            self.pattern_alignment_pending_index = None
-            self.set_pattern_alignment_state("select_second")
-            self.stage_view.set_pattern_selection_enabled(True)
-            self.pattern_status_label.setText("Click second pattern point")
-            return
-
-        if self.pattern_alignment_first is None:
+        if self.pattern_alignment_state != "fine_point":
             self.cancel_pattern_alignment("Alignment failed")
             return
-        first_index, _px, _py, first_x, first_y = self.pattern_alignment_first
-        self.set_pattern_transform_from_alignment(
-            first_index,
-            (first_x, first_y),
-            point_index,
-            stage_position,
-        )
+
+        point = self.pattern_points[point_index]
+        if not self.add_pattern_alignment_measurement(point, stage_position):
+            return
         self.pattern_alignment_pending_index = None
-        self.pattern_alignment_first = None
-        self.finish_pattern_alignment()
-        self.stage_view.set_pattern_selection_enabled(False)
-        self.pattern_status_label.setText("Aligned")
+        if self.pattern_alignment_is_complete():
+            self.finish_pattern_alignment()
+            self.stage_view.set_pattern_selection_enabled(False)
+            self.pattern_status_label.setText("Aligned")
+            return
+
+        self.pattern_alignment_current_index = len(self.pattern_alignment_measurements)
+        self.set_pattern_alignment_state("select_point")
+        self.stage_view.set_pattern_selection_enabled(True)
+        label = ALIGNMENT_POINT_LABELS[self.pattern_alignment_current_index]
+        self.pattern_status_label.setText(f"Click pattern point {label}")
 
     def confirm_anchor_alignment_point(
         self, stage_position: tuple[float, float]
@@ -4405,43 +5206,83 @@ class MainWindow(QMainWindow):
             self.cancel_pattern_alignment("Alignment failed")
             return
 
-        first_anchor, second_anchor = self.pattern_alignment_anchor_points
-        if self.pattern_alignment_state == "anchor_fine_first":
-            self.pattern_alignment_anchor_first = (
-                first_anchor[0],
-                first_anchor[1],
-                stage_position[0],
-                stage_position[1],
-            )
-            self.set_pattern_transform_from_points(first_anchor, stage_position)
-            rough_x, rough_y = self.pattern_point_to_stage(second_anchor)
-            if not self.send_synchronized_motion(
-                *self.alignment_safe_z_payloads(),
-                f"V1 X{rough_x:.6f} Y{rough_y:.6f}",
-                require_homed=False,
-            ):
-                return
-            self.set_pattern_alignment_state("anchor_move_second")
-            self.pattern_status_label.setText("Rough moving to anchor 2; then Lower Z")
-            return
-
-        if self.pattern_alignment_anchor_first is None:
+        if self.pattern_alignment_state != "anchor_fine":
             self.cancel_pattern_alignment("Alignment failed")
             return
 
-        first_x, first_y, first_stage_x, first_stage_y = (
-            self.pattern_alignment_anchor_first
+        anchor_index = self.pattern_alignment_current_index
+        if anchor_index >= len(self.pattern_alignment_anchor_points):
+            self.cancel_pattern_alignment("Alignment failed")
+            return
+        anchor = self.pattern_alignment_anchor_points[anchor_index]
+        if not self.add_pattern_alignment_measurement(anchor, stage_position):
+            return
+
+        if self.pattern_alignment_is_complete():
+            self.pattern_alignment_anchor_points = None
+            self.pattern_alignment_anchor_first = None
+            self.finish_pattern_alignment()
+            self.pattern_status_label.setText("Aligned to anchors")
+            return
+
+        self.pattern_alignment_current_index = len(self.pattern_alignment_measurements)
+        next_anchor = self.pattern_alignment_anchor_points[
+            self.pattern_alignment_current_index
+        ]
+        rough_x, rough_y = self.pattern_point_to_stage(next_anchor)
+        if not self.send_synchronized_motion(
+            *self.alignment_safe_z_payloads(),
+            f"V1 X{rough_x:.6f} Y{rough_y:.6f}",
+            require_homed=False,
+        ):
+            return
+        label = ALIGNMENT_POINT_LABELS[self.pattern_alignment_current_index]
+        self.set_pattern_alignment_state("anchor_move")
+        self.pattern_status_label.setText(
+            f"Rough moving to anchor {label}; then Lower Z"
         )
-        self.set_pattern_transform_from_points(
-            (first_x, first_y),
-            (first_stage_x, first_stage_y),
-            second_anchor,
-            stage_position,
+
+    def add_pattern_alignment_measurement(
+        self,
+        nominal_point: tuple[float, float],
+        stage_position: tuple[float, float],
+    ) -> bool:
+        previous_measurements = list(self.pattern_alignment_measurements)
+        self.pattern_alignment_measurements.append(
+            (
+                nominal_point[0],
+                nominal_point[1],
+                stage_position[0],
+                stage_position[1],
+            )
         )
-        self.pattern_alignment_anchor_points = None
-        self.pattern_alignment_anchor_first = None
-        self.finish_pattern_alignment()
-        self.pattern_status_label.setText("Aligned to anchors")
+        if not self.apply_pattern_transform_from_measurements(
+            self.pattern_alignment_measurements,
+            warn_on_scale=False,
+        ):
+            self.pattern_alignment_measurements = previous_measurements
+            self.set_pattern_alignment_reference_points(
+                [
+                    (nominal_x, nominal_y)
+                    for nominal_x, nominal_y, _stage_x, _stage_y
+                    in previous_measurements
+                ]
+            )
+            return False
+        self.set_pattern_alignment_reference_points(
+            [
+                (nominal_x, nominal_y)
+                for nominal_x, nominal_y, _stage_x, _stage_y
+                in self.pattern_alignment_measurements
+            ]
+        )
+        return True
+
+    def pattern_alignment_is_complete(self) -> bool:
+        return (
+            len(self.pattern_alignment_measurements)
+            >= self.alignment_required_point_count()
+        )
 
     def finish_pattern_alignment(self) -> None:
         self.pattern_alignment_state = None
@@ -4450,6 +5291,8 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_first = None
         self.pattern_alignment_anchor_points = None
         self.pattern_alignment_anchor_first = None
+        self.pattern_alignment_completed = True
+        self.warn_if_pattern_scale_deviation()
         self.set_leveling_work_area_to_aligned_pattern_bounds()
         self.raise_to_max_z_after_alignment()
         self.stage_view.set_pattern_selection_enabled(False)
@@ -4604,6 +5447,13 @@ class MainWindow(QMainWindow):
         self.motion_busy = False
         self.cancel_printing("Pattern print aborted")
         self.append_log("# pattern print aborted; pending print commands cleared")
+        if self.serial_thread is None:
+            self.update_control_states()
+            return
+        self.append_log("# homing after pattern print abort")
+        self.motion_busy = True
+        self.send_payload("V5", force=True)
+        self.send_payload("M400", force=True)
         self.update_control_states()
 
     def queue_prepared_pattern_print(self) -> None:
@@ -4641,6 +5491,7 @@ class MainWindow(QMainWindow):
     ) -> tuple[list[str], list[tuple[str, int] | None]]:
         print_height = self.pattern_print_height_spin.value()
         travel_height = self.pattern_travel_height_spin.value()
+        lifting_feedrate = self.pattern_lifting_speed_spin.value() * 60.0
         kick = self.pattern_kick_spin.value() / 1000.0
         retract = self.pattern_retract_spin.value() / 1000.0
 
@@ -4673,7 +5524,7 @@ class MainWindow(QMainWindow):
             events.append(("finish", point_index))
             commands.append(f"V102 Z{travel_height:g}")
             events.append(None)
-            commands.append(f"V1 Z{z:.6f} D")
+            commands.append(f"V1 Z{z:.6f} D F{lifting_feedrate:g}")
             events.append(None)
             commands.append("V102")
             events.append(None)
@@ -4929,11 +5780,13 @@ class MainWindow(QMainWindow):
         self.height_map_finishing = False
         self.height_map_abort_requested = False
         self.height_map_probe_phase = None
+        self.height_map_completed = True
         if work_area is not None:
             self.stage_view.set_work_area(*work_area)
         self.stage_view.set_height_map_points(self.height_map_points)
         self.height_map_status_label.setText(self.height_map_summary())
         self.append_log(f"# loaded height map: {path}")
+        self.maybe_warn_height_map_deviation()
         self.update_control_states()
 
     def height_map_work_area_data(self) -> dict[str, float]:
@@ -5040,6 +5893,7 @@ class MainWindow(QMainWindow):
         self.height_map_finishing = False
         self.height_map_abort_requested = False
         self.height_map_probe_phase = None
+        self.height_map_completed = False
         self.motion_busy = True
         self.stage_view.set_height_map_points([])
         self.height_map_status_label.setText(
@@ -5154,13 +6008,42 @@ class MainWindow(QMainWindow):
         self.height_map_probe_phase = None
         self.motion_busy = False
         if aborted:
+            self.height_map_completed = False
             status = self.aborted_height_map_summary()
             self.height_map_status_label.setText(status)
             self.append_log(f"# height map aborted: {status}")
         else:
+            self.height_map_completed = (
+                bool(self.height_map_points)
+                and len(self.height_map_points) == len(self.height_map_plan)
+            )
             self.height_map_status_label.setText(self.height_map_summary())
             self.append_log(f"# height map completed: {self.height_map_summary()}")
+            if self.height_map_completed:
+                self.maybe_warn_height_map_deviation()
         self.update_control_states()
+
+    def maybe_warn_height_map_deviation(self) -> None:
+        if not self.height_map_points:
+            return
+        heights = [height for _x, _y, height in self.height_map_points]
+        height_range = max(heights) - min(heights)
+        threshold = self.height_map_max_deviation_warning_mm
+        if height_range <= threshold:
+            return
+
+        self.append_log(
+            "! height map deviation warning: "
+            f"{height_range:.6f} mm > {threshold:.6f} mm"
+        )
+        QMessageBox.warning(
+            self,
+            "Height Map Deviation",
+            "Height map Z range is "
+            f"{height_range:.4f} mm, exceeding the configured "
+            f"{threshold:.4f} mm warning threshold.",
+            QMessageBox.StandardButton.Ok,
+        )
 
     def height_map_summary(self) -> str:
         if not self.height_map_points:
@@ -5200,6 +6083,7 @@ class MainWindow(QMainWindow):
         self.height_map_finishing = False
         self.height_map_abort_requested = False
         self.height_map_probe_phase = None
+        self.height_map_completed = False
         self.height_map_status_label.setText(status)
 
     def emergency_stop(self) -> None:
@@ -5362,6 +6246,7 @@ class MainWindow(QMainWindow):
                 self.tool_label.setText(f"Dispenser: {tool.tool_type}")
             else:
                 self.tool_label.setText(f"Dispenser: {tool.tool_type} v{tool.version}")
+            self.update_control_states()
 
     def on_error_line(self, line: str) -> None:
         self.motion_busy = False
