@@ -1842,6 +1842,7 @@ class MainWindow(QMainWindow):
         self.height_map_plan: list[tuple[float, float]] = []
         self.height_map_index = 0
         self.height_map_active = False
+        self.height_map_preparing = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
         self.height_map_abort_requested = False
@@ -2263,7 +2264,6 @@ class MainWindow(QMainWindow):
         layout.addRow("Probe points", point_count_layout)
         layout.addRow("Height map", self.height_map_status_label)
         layout.addRow(button_widget)
-        self.homed_motion_widgets.append(self.start_height_map_button)
         return group
 
     def _build_printing_group(self) -> QGroupBox:
@@ -3408,6 +3408,7 @@ class MainWindow(QMainWindow):
         self.height_map_plan = []
         self.height_map_index = 0
         self.height_map_active = False
+        self.height_map_preparing = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
         self.height_map_abort_requested = False
@@ -4412,10 +4413,15 @@ class MainWindow(QMainWindow):
             widget.setEnabled(can_issue)
         for widget in self.homed_motion_widgets:
             widget.setEnabled(homed_motion_allowed)
-        self.height_map_x_points_spin.setEnabled(not self.height_map_active)
-        self.height_map_y_points_spin.setEnabled(not self.height_map_active)
+        self.height_map_x_points_spin.setEnabled(
+            not self.height_map_active and not self.height_map_preparing
+        )
+        self.height_map_y_points_spin.setEnabled(
+            not self.height_map_active and not self.height_map_preparing
+        )
         height_map_idle = (
             not self.height_map_active
+            and not self.height_map_preparing
             and not self.printing_active
             and not self.print_circle_editing
         )
@@ -4426,7 +4432,9 @@ class MainWindow(QMainWindow):
             bool(self.height_map_points) and height_map_idle
         )
         self.load_height_map_button.setEnabled(can_issue and height_map_idle)
-        if self.height_map_active:
+        if self.height_map_preparing:
+            self.start_height_map_button.setText("Initializing...")
+        elif self.height_map_active:
             if self.height_map_abort_requested:
                 self.start_height_map_button.setText("Aborting...")
             elif self.height_map_finishing:
@@ -4441,7 +4449,11 @@ class MainWindow(QMainWindow):
                 and not self.height_map_finishing
                 and not self.height_map_abort_requested
             )
-            or (homed_motion_allowed and not self.height_map_active)
+            or (
+                can_issue
+                and not self.height_map_active
+                and not self.height_map_preparing
+            )
         )
         if hasattr(self, "printing_widgets"):
             for widget in self.printing_widgets:
@@ -4604,6 +4616,28 @@ class MainWindow(QMainWindow):
 
     def update_motion_sync(self, line: str) -> None:
         if not self.motion_busy:
+            return
+        if self.height_map_preparing:
+            if is_error_line(line):
+                self.height_map_preparing = False
+                self.motion_busy = False
+                self.height_map_status_label.setText(
+                    "Probe initialization failed"
+                )
+                self.append_log("! height map probe initialization failed")
+                self.update_control_states()
+                return
+            if (
+                (line == "ok" or line == "empty" or line.startswith("positionUpdate"))
+                and (
+                    self.serial_thread is None
+                    or self.serial_thread.is_idle()
+                )
+            ):
+                self.height_map_preparing = False
+                self.motion_busy = False
+                self.append_log("# probe initialized; starting height map")
+                self.begin_height_map_probe_run()
             return
         if self.height_map_active:
             if self.height_map_finishing:
@@ -5685,7 +5719,12 @@ class MainWindow(QMainWindow):
             self.pattern_print_active = False
 
     def save_height_map(self) -> None:
-        if self.height_map_active or self.printing_active or self.print_circle_editing:
+        if (
+            self.height_map_active
+            or self.height_map_preparing
+            or self.printing_active
+            or self.print_circle_editing
+        ):
             self.append_log("! cannot save height map while motion/editing is active")
             return
         if not self.height_map_points:
@@ -5742,6 +5781,7 @@ class MainWindow(QMainWindow):
         if (
             self.motion_busy
             or self.height_map_active
+            or self.height_map_preparing
             or self.printing_active
             or self.print_circle_editing
         ):
@@ -5776,6 +5816,7 @@ class MainWindow(QMainWindow):
         self.height_map_plan = []
         self.height_map_index = 0
         self.height_map_active = False
+        self.height_map_preparing = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
         self.height_map_abort_requested = False
@@ -5847,7 +5888,12 @@ class MainWindow(QMainWindow):
         return points
 
     def delete_height_map(self) -> None:
-        if self.height_map_active or self.printing_active or self.print_circle_editing:
+        if (
+            self.height_map_active
+            or self.height_map_preparing
+            or self.printing_active
+            or self.print_circle_editing
+        ):
             self.append_log("! cannot delete height map while motion/editing is active")
             return
         self.reset_height_map()
@@ -5872,11 +5918,13 @@ class MainWindow(QMainWindow):
         if self.serial_thread is None:
             self.append_log("! not connected")
             return
-        if self.motion_busy or self.height_map_active or self.print_circle_editing:
+        if (
+            self.motion_busy
+            or self.height_map_active
+            or self.height_map_preparing
+            or self.print_circle_editing
+        ):
             self.append_log("! height map blocked: waiting for active motion")
-            return
-        if not self.all_axes_homed:
-            self.warn_not_homed()
             return
         if not self.ensure_probe_ready():
             return
@@ -5886,16 +5934,55 @@ class MainWindow(QMainWindow):
             self.append_log("! height map has no probe points")
             return
 
+        self.prepare_height_map_run_state()
+        if not self.all_axes_homed:
+            self.start_height_map_probe_initialization()
+            return
+
+        self.begin_height_map_probe_run()
+
+    def prepare_height_map_run_state(self) -> None:
         self.height_map_points = []
         self.height_map_index = 0
-        self.height_map_active = True
+        self.height_map_active = False
+        self.height_map_preparing = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
         self.height_map_abort_requested = False
         self.height_map_probe_phase = None
         self.height_map_completed = False
-        self.motion_busy = True
         self.stage_view.set_height_map_points([])
+
+    def start_height_map_probe_initialization(self) -> None:
+        self.height_map_preparing = True
+        self.motion_busy = True
+        self.height_map_status_label.setText("Initializing probe")
+        self.append_log(
+            "# height map probing: stage not homed; initializing probe"
+        )
+        if not self.send_payload("V3 Z", force=True):
+            self.height_map_preparing = False
+            self.motion_busy = False
+            self.height_map_status_label.setText("Probe initialization failed")
+            self.update_control_states()
+            return
+        if not self.send_payload("M400", force=True):
+            self.height_map_preparing = False
+            self.motion_busy = False
+            self.height_map_status_label.setText("Probe initialization failed")
+            self.update_control_states()
+            return
+        self.update_control_states()
+
+    def begin_height_map_probe_run(self) -> None:
+        if not self.height_map_plan:
+            self.append_log("! height map has no probe points")
+            self.update_control_states()
+            return
+
+        self.height_map_preparing = False
+        self.height_map_active = True
+        self.motion_busy = True
         self.height_map_status_label.setText(
             f"Probing 0/{len(self.height_map_plan)}"
         )
@@ -6002,6 +6089,7 @@ class MainWindow(QMainWindow):
     def finish_height_map(self) -> None:
         aborted = self.height_map_abort_requested
         self.height_map_active = False
+        self.height_map_preparing = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
         self.height_map_abort_requested = False
@@ -6076,9 +6164,14 @@ class MainWindow(QMainWindow):
         self.update_control_states()
 
     def cancel_height_map(self, status: str) -> None:
-        if not self.height_map_active and not self.height_map_finishing:
+        if (
+            not self.height_map_active
+            and not self.height_map_preparing
+            and not self.height_map_finishing
+        ):
             return
         self.height_map_active = False
+        self.height_map_preparing = False
         self.height_map_waiting_for_probe = False
         self.height_map_finishing = False
         self.height_map_abort_requested = False
