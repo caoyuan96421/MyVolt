@@ -107,6 +107,7 @@ MIN_PRINT_CIRCLE_RADIUS_MM = 1.0
 CIRCLE_PRINT_SEGMENT_MM = 1.0
 SERIAL_COMMAND_INTERVAL_S = 0.01
 DEFAULT_STAY_ALIVE_POLL_SECONDS = 60
+DEFAULT_MAX_TRAVEL_SPEED_MM_S = 0.0
 STAY_ALIVE_PAYLOAD = "M400"
 MAXIMUM_Z_RETURN_MARGIN_MM = 0.5
 DEFAULT_HEIGHT_MAP_MAX_DEVIATION_WARNING_MM = 0.5
@@ -153,6 +154,7 @@ class OptionsDialog(QDialog):
         auto_margin_mm: float,
         height_map_max_deviation_mm: float,
         use_four_point_alignment: bool,
+        max_travel_speed_mm_s: float,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -164,6 +166,7 @@ class OptionsDialog(QDialog):
         self.auto_margin_spin = QDoubleSpinBox()
         self.height_map_deviation_spin = QDoubleSpinBox()
         self.four_point_alignment_check = QCheckBox("Use 4-point alignment")
+        self.max_travel_speed_spin = QDoubleSpinBox()
 
         self._build_ui(
             stay_alive_poll_seconds,
@@ -171,6 +174,7 @@ class OptionsDialog(QDialog):
             auto_margin_mm,
             height_map_max_deviation_mm,
             use_four_point_alignment,
+            max_travel_speed_mm_s,
         )
 
     def _build_ui(
@@ -180,6 +184,7 @@ class OptionsDialog(QDialog):
         auto_margin_mm: float,
         height_map_max_deviation_mm: float,
         use_four_point_alignment: bool,
+        max_travel_speed_mm_s: float,
     ) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -191,6 +196,12 @@ class OptionsDialog(QDialog):
         self.stay_alive_spin.setValue(stay_alive_poll_seconds)
         self.stay_alive_spin.setSuffix(" s")
         form.addRow("Stay alive polling period", self.stay_alive_spin)
+
+        self.max_travel_speed_spin.setRange(0.0, 1000.0)
+        self.max_travel_speed_spin.setDecimals(2)
+        self.max_travel_speed_spin.setValue(max_travel_speed_mm_s)
+        self.max_travel_speed_spin.setSuffix(" mm/s")
+        form.addRow("Max travel speed", self.max_travel_speed_spin)
 
         margin_widget = QWidget()
         margin_layout = QHBoxLayout(margin_widget)
@@ -242,6 +253,9 @@ class OptionsDialog(QDialog):
 
     def use_four_point_alignment(self) -> bool:
         return self.four_point_alignment_check.isChecked()
+
+    def max_travel_speed_mm_s(self) -> float:
+        return self.max_travel_speed_spin.value()
 
 
 class RotatableCameraView(QGraphicsView):
@@ -1897,6 +1911,7 @@ class MainWindow(QMainWindow):
         self.saved_serial_port = ""
         self.stay_alive_enabled = False
         self.stay_alive_poll_seconds = DEFAULT_STAY_ALIVE_POLL_SECONDS
+        self.max_travel_speed_mm_s = DEFAULT_MAX_TRAVEL_SPEED_MM_S
         self.auto_height_map_margin_enabled = True
         self.auto_height_map_margin_mm = DEFAULT_ALIGNMENT_WORK_AREA_MARGIN_MM
         self.height_map_max_deviation_warning_mm = (
@@ -2009,6 +2024,7 @@ class MainWindow(QMainWindow):
             self.auto_height_map_margin_mm,
             self.height_map_max_deviation_warning_mm,
             self.use_four_point_alignment,
+            self.max_travel_speed_mm_s,
             self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -2021,6 +2037,7 @@ class MainWindow(QMainWindow):
             dialog.height_map_max_deviation_mm()
         )
         self.use_four_point_alignment = dialog.use_four_point_alignment()
+        self.max_travel_speed_mm_s = dialog.max_travel_speed_mm_s()
         self.apply_stay_alive_poll_interval()
         self.save_options_config()
         self.append_log("# options updated")
@@ -2648,6 +2665,12 @@ class MainWindow(QMainWindow):
                 self.use_four_point_alignment = bool(
                     data["use_four_point_alignment"]
                 )
+            max_travel_speed = data.get("max_travel_speed_mm_s")
+            if max_travel_speed is not None:
+                value = float(max_travel_speed)
+                if not math.isfinite(value):
+                    raise ValueError("max_travel_speed_mm_s must be finite")
+                self.max_travel_speed_mm_s = clamp(value, 0.0, 1000.0)
         except (TypeError, ValueError) as exc:
             self.append_log(f"! failed to parse options config: {exc}")
 
@@ -2665,6 +2688,7 @@ class MainWindow(QMainWindow):
                 self.height_map_max_deviation_warning_mm
             ),
             "use_four_point_alignment": self.use_four_point_alignment,
+            "max_travel_speed_mm_s": self.max_travel_speed_mm_s,
         }
         try:
             with OPTIONS_CONFIG_PATH.open("w", encoding="utf-8") as file:
@@ -3384,7 +3408,11 @@ class MainWindow(QMainWindow):
         self.update_control_states()
 
     def send_payload(
-        self, payload: str, urgent: bool = False, force: bool = False
+        self,
+        payload: str,
+        urgent: bool = False,
+        force: bool = False,
+        apply_travel_speed: bool = True,
     ) -> bool:
         if self.serial_thread is None:
             self.append_log(f"! not connected: {payload}")
@@ -3392,8 +3420,31 @@ class MainWindow(QMainWindow):
         if self.motion_busy and not urgent and not force:
             self.append_log(f"! command blocked during M400 synchronization: {payload}")
             return False
+        if apply_travel_speed:
+            payload = self.payload_with_max_travel_speed(payload)
         self.serial_thread.enqueue(payload, urgent=urgent)
         return True
+
+    def payload_with_max_travel_speed(self, payload: str) -> str:
+        if self.max_travel_speed_mm_s <= 0.0:
+            return payload
+        stripped = payload.strip()
+        if not stripped:
+            return payload
+
+        parts = stripped.split()
+        if not parts:
+            return payload
+        command = parts[0].upper()
+        if command not in {"G0", "G1", "V1", "V2"}:
+            return payload
+        if any(part.upper().startswith("F") for part in parts[1:]):
+            return payload
+        if not any(part[:1].upper() in {"X", "Y", "Z"} for part in parts[1:]):
+            return payload
+
+        feedrate_mm_min = self.max_travel_speed_mm_s * 60.0
+        return f"{stripped} F{feedrate_mm_min:g}"
 
     def reset_tool_offsets(self) -> None:
         self.probe_tool_offset = None
@@ -4589,7 +4640,10 @@ class MainWindow(QMainWindow):
         self.append_log("! motion blocked: axes are not all homed")
 
     def send_synchronized_motion(
-        self, *payloads: str, require_homed: bool = True
+        self,
+        *payloads: str,
+        require_homed: bool = True,
+        apply_travel_speed: bool = True,
     ) -> bool:
         if self.motion_busy:
             self.append_log("! command blocked: waiting for M400 synchronization")
@@ -4603,12 +4657,12 @@ class MainWindow(QMainWindow):
 
         queued_any = False
         for payload in payloads:
-            if self.send_payload(payload):
+            if self.send_payload(payload, apply_travel_speed=apply_travel_speed):
                 queued_any = True
         if not queued_any:
             return False
 
-        if not self.send_payload("M400"):
+        if not self.send_payload("M400", apply_travel_speed=False):
             return False
         self.motion_busy = True
         self.update_control_states()
@@ -6202,9 +6256,12 @@ class MainWindow(QMainWindow):
         if command == "V4" and not self.ensure_probe_ready():
             return
         if self.raw_payload_is_motion(payload):
-            sent = self.send_synchronized_motion(payload)
+            sent = self.send_synchronized_motion(
+                payload,
+                apply_travel_speed=False,
+            )
         else:
-            sent = self.send_payload(payload)
+            sent = self.send_payload(payload, apply_travel_speed=False)
         if sent:
             self.raw_input.clear()
 
