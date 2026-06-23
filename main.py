@@ -78,6 +78,7 @@ from myvolt_protocol import (
     parse_temperature,
     parse_tool_status,
 )
+from pattern_editor import PatternEditorDialog
 
 
 STAGE_X_MAX_MM = 128.0
@@ -1894,6 +1895,7 @@ class MainWindow(QMainWindow):
         ] = []
         self.pattern_alignment_completed = False
         self.alignment_procedure_dialog: AlignmentProcedureDialog | None = None
+        self.pattern_editor_dialog: PatternEditorDialog | None = None
         self.pattern_print_active = False
         self.pending_pattern_print_points: list[
             tuple[int, float, float, float]
@@ -1969,7 +1971,7 @@ class MainWindow(QMainWindow):
         self.load_camera_config()
         self.refresh_alignment_cameras()
         self.refresh_ports()
-        self.initialize_pattern_transform_to_visible_bottom_left()
+        self.initialize_pattern_transform_to_work_area_center()
         self.update_height_map_preview()
         self.update_control_states()
 
@@ -2445,6 +2447,7 @@ class MainWindow(QMainWindow):
         layout = QFormLayout(group)
 
         self.pattern_load_button = QPushButton("Load")
+        self.pattern_edit_button = QPushButton("Edit")
         self.pattern_align_button = QPushButton("Click && Align")
         self.pattern_anchor_align_button = QPushButton("Align to Anchors")
         self.pattern_reset_button = QPushButton("Reset")
@@ -2454,6 +2457,7 @@ class MainWindow(QMainWindow):
 
         action_layout = QHBoxLayout()
         action_layout.addWidget(self.pattern_load_button)
+        action_layout.addWidget(self.pattern_edit_button)
         action_layout.addWidget(self.pattern_reset_button)
         alignment_mode_layout = QHBoxLayout()
         alignment_mode_layout.addWidget(self.pattern_align_button)
@@ -2559,6 +2563,7 @@ class MainWindow(QMainWindow):
         )
         self.print_circle_button.clicked.connect(self.handle_print_circle_button)
         self.pattern_load_button.clicked.connect(self.load_pattern)
+        self.pattern_edit_button.clicked.connect(self.open_pattern_editor)
         self.pattern_align_button.clicked.connect(self.handle_pattern_align_button)
         self.pattern_anchor_align_button.clicked.connect(
             self.handle_pattern_anchor_align_button
@@ -3526,6 +3531,100 @@ class MainWindow(QMainWindow):
         self.pattern_status_label.setText(f"Loaded {Path(path).name}")
         self.update_control_states()
 
+    def open_pattern_editor(self) -> None:
+        if (
+            self.pattern_alignment_state is not None
+            or self.motion_busy
+            or self.height_map_active
+            or self.printing_active
+            or self.pattern_print_active
+        ):
+            self.append_log("! cannot edit pattern while motion is active")
+            return
+
+        if self.pattern_editor_dialog is not None:
+            if self.pattern_editor_dialog.isVisible():
+                self.pattern_editor_dialog.raise_()
+                self.pattern_editor_dialog.activateWindow()
+                return
+            self.pattern_editor_dialog = None
+
+        dialog = PatternEditorDialog(
+            self.pattern_points,
+            self.pattern_file_path,
+            self,
+        )
+        self.pattern_editor_dialog = dialog
+        dialog.points_applied.connect(self.apply_pattern_editor_points)
+        dialog.finished.connect(
+            lambda _result, editor=dialog: self.on_pattern_editor_closed(editor)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def on_pattern_editor_closed(self, editor: PatternEditorDialog) -> None:
+        if self.pattern_editor_dialog is editor:
+            self.pattern_editor_dialog = None
+
+    def apply_pattern_editor_points(self, points, file_path) -> None:
+        if (
+            self.pattern_alignment_state is not None
+            or self.motion_busy
+            or self.height_map_active
+            or self.printing_active
+            or self.pattern_print_active
+        ):
+            self.append_log("! cannot apply pattern edits while motion is active")
+            return
+
+        try:
+            parsed_points = [
+                (float(point[0]), float(point[1]), float(point[2]))
+                for point in points
+            ]
+        except (TypeError, ValueError, IndexError) as exc:
+            QMessageBox.critical(
+                self,
+                "Apply Pattern Failed",
+                f"Editor returned invalid point data:\n{exc}",
+                QMessageBox.StandardButton.Ok,
+            )
+            return
+        if any(
+            not all(math.isfinite(value) for value in point)
+            for point in parsed_points
+        ):
+            QMessageBox.critical(
+                self,
+                "Apply Pattern Failed",
+                "Editor returned non-finite point data.",
+                QMessageBox.StandardButton.Ok,
+            )
+            return
+
+        self.pattern_points = parsed_points
+        self.pattern_file_path = str(file_path) if file_path else None
+        self.pattern_alignment_state = None
+        self.pattern_alignment_mode = None
+        self.pattern_alignment_first = None
+        self.pattern_alignment_pending_index = None
+        self.pattern_alignment_anchor_points = None
+        self.pattern_alignment_anchor_first = None
+        self.stage_view.set_pattern_selection_enabled(False)
+        self.stage_view.set_selected_pattern_index(None)
+        self.reset_pattern_print_progress()
+        self.update_pattern_display()
+        if self.pattern_points:
+            source = Path(self.pattern_file_path).name if self.pattern_file_path else "editor"
+            self.pattern_status_label.setText(
+                f"Edited {source}: {len(self.pattern_points)} pts"
+            )
+        else:
+            self.pattern_status_label.setText("No pattern")
+        self.append_log(f"# pattern editor applied: {len(self.pattern_points)} points")
+        self.update_control_states()
+
     def save_pattern_alignment(self) -> None:
         if (
             self.pattern_alignment_state is not None
@@ -3855,8 +3954,10 @@ class MainWindow(QMainWindow):
             raise ValueError("pattern contains no points")
         return points
 
-    def initialize_pattern_transform_to_visible_bottom_left(self) -> None:
-        offset_x, offset_y = self.stage_view.visible_stage_bottom_left()
+    def initialize_pattern_transform_to_work_area_center(self) -> None:
+        work_x, work_y, work_width, work_height = self.stage_view.work_area()
+        offset_x = work_x + work_width / 2.0
+        offset_y = work_y + work_height / 2.0
         self.set_pattern_transform_matrix(
             -1.0,
             0.0,
@@ -3882,9 +3983,9 @@ class MainWindow(QMainWindow):
         self.stage_view.set_pattern_selection_enabled(False)
         self.stage_view.set_selected_pattern_index(None)
         self.reset_pattern_print_progress()
-        self.initialize_pattern_transform_to_visible_bottom_left()
+        self.initialize_pattern_transform_to_work_area_center()
         if self.pattern_points:
-            self.pattern_status_label.setText("Reset to visible bottom-left")
+            self.pattern_status_label.setText("Reset to work-area center")
         else:
             self.pattern_status_label.setText("No pattern")
         self.update_control_states()
@@ -4546,6 +4647,7 @@ class MainWindow(QMainWindow):
                 and self.pattern_alignment_state is None
             )
             self.pattern_load_button.setEnabled(pattern_idle)
+            self.pattern_edit_button.setEnabled(pattern_idle)
             self.pattern_reset_button.setEnabled(has_pattern and pattern_idle)
             self.pattern_save_alignment_button.setEnabled(
                 pattern_idle
