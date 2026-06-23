@@ -1866,6 +1866,8 @@ class MainWindow(QMainWindow):
         self.height_map_completed = False
         self.pattern_points: list[PatternPoint] = []
         self.pattern_file_path: str | None = None
+        self.pattern_print_compensation_x = 0.0
+        self.pattern_print_compensation_y = 0.0
         self.pattern_work_offset_x = 0.0
         self.pattern_work_offset_y = 0.0
         self.pattern_transform_a11 = -1.0
@@ -2470,6 +2472,26 @@ class MainWindow(QMainWindow):
         self.pattern_transform_label = QLabel("Offset: --\nRotation: --\nScale: --")
         self.pattern_status_label = QLabel("Idle")
 
+        self.pattern_print_compensation_x_spin = QDoubleSpinBox()
+        self.pattern_print_compensation_x_spin.setRange(-10000.0, 10000.0)
+        self.pattern_print_compensation_x_spin.setDecimals(3)
+        self.pattern_print_compensation_x_spin.setValue(0.0)
+        self.pattern_print_compensation_x_spin.setSuffix(" mm")
+        self.pattern_print_compensation_x_spin.setToolTip(
+            "Print-time only PCS X compensation, applied opposite to PCS sign. "
+            "Does not affect display, alignment, or leveling."
+        )
+
+        self.pattern_print_compensation_y_spin = QDoubleSpinBox()
+        self.pattern_print_compensation_y_spin.setRange(-10000.0, 10000.0)
+        self.pattern_print_compensation_y_spin.setDecimals(3)
+        self.pattern_print_compensation_y_spin.setValue(0.0)
+        self.pattern_print_compensation_y_spin.setSuffix(" mm")
+        self.pattern_print_compensation_y_spin.setToolTip(
+            "Print-time only PCS Y compensation, applied opposite to PCS sign. "
+            "Does not affect display, alignment, or leveling."
+        )
+
         self.pattern_print_height_spin = QDoubleSpinBox()
         self.pattern_print_height_spin.setRange(0.0, 10.0)
         self.pattern_print_height_spin.setDecimals(3)
@@ -2505,6 +2527,8 @@ class MainWindow(QMainWindow):
         layout.addRow("", alignment_file_layout)
         layout.addRow("Stats", self.pattern_stats_label)
         layout.addRow("Transform", self.pattern_transform_label)
+        layout.addRow("Compensation X", self.pattern_print_compensation_x_spin)
+        layout.addRow("Compensation Y", self.pattern_print_compensation_y_spin)
         layout.addRow("Print height", self.pattern_print_height_spin)
         layout.addRow("Kick", self.pattern_kick_spin)
         layout.addRow("Retract", self.pattern_retract_spin)
@@ -2572,6 +2596,12 @@ class MainWindow(QMainWindow):
         self.pattern_save_alignment_button.clicked.connect(self.save_pattern_alignment)
         self.pattern_load_alignment_button.clicked.connect(self.load_pattern_alignment)
         self.pattern_print_button.clicked.connect(self.on_pattern_print_button_clicked)
+        self.pattern_print_compensation_x_spin.valueChanged.connect(
+            lambda _value: self.on_pattern_print_compensation_changed()
+        )
+        self.pattern_print_compensation_y_spin.valueChanged.connect(
+            lambda _value: self.on_pattern_print_compensation_changed()
+        )
         for spin in (
             self.pattern_print_height_spin,
             self.pattern_kick_spin,
@@ -3625,6 +3655,15 @@ class MainWindow(QMainWindow):
         self.append_log(f"# pattern editor applied: {len(self.pattern_points)} points")
         self.update_control_states()
 
+    def on_pattern_print_compensation_changed(self) -> None:
+        self.pattern_print_compensation_x = (
+            self.pattern_print_compensation_x_spin.value()
+        )
+        self.pattern_print_compensation_y = (
+            self.pattern_print_compensation_y_spin.value()
+        )
+        self.reset_pattern_print_progress()
+
     def save_pattern_alignment(self) -> None:
         if (
             self.pattern_alignment_state is not None
@@ -4043,10 +4082,16 @@ class MainWindow(QMainWindow):
     def transformed_pattern_print_points(
         self,
     ) -> list[tuple[int, float, float, float]]:
-        return [
-            (index, *self.pattern_point_to_stage(point), point[2])
-            for index, point in enumerate(self.pattern_points)
-        ]
+        points: list[tuple[int, float, float, float]] = []
+        for index, point in enumerate(self.pattern_points):
+            shifted_point = (
+                point[0] - self.pattern_print_compensation_x,
+                point[1] - self.pattern_print_compensation_y,
+                point[2],
+            )
+            stage_x, stage_y = self.pattern_point_to_stage(shifted_point)
+            points.append((index, stage_x, stage_y, point[2]))
+        return points
 
     def transformed_pattern_positions(self) -> list[tuple[float, float]]:
         return [
@@ -4688,6 +4733,8 @@ class MainWindow(QMainWindow):
                     )
                 )
             for widget in (
+                self.pattern_print_compensation_x_spin,
+                self.pattern_print_compensation_y_spin,
                 self.pattern_print_height_spin,
                 self.pattern_kick_spin,
                 self.pattern_retract_spin,
