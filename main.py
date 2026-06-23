@@ -140,6 +140,7 @@ STAGE_PROBE_REGIONS = (
 MEASUREMENT_RE = re.compile(
     r"Measurement:\s+(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+))"
 )
+PatternPoint = tuple[float, float, float]
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -1862,7 +1863,7 @@ class MainWindow(QMainWindow):
         self.height_map_abort_requested = False
         self.height_map_probe_phase: str | None = None
         self.height_map_completed = False
-        self.pattern_points: list[tuple[float, float]] = []
+        self.pattern_points: list[PatternPoint] = []
         self.pattern_file_path: str | None = None
         self.pattern_work_offset_x = 0.0
         self.pattern_work_offset_y = 0.0
@@ -1894,7 +1895,9 @@ class MainWindow(QMainWindow):
         self.pattern_alignment_completed = False
         self.alignment_procedure_dialog: AlignmentProcedureDialog | None = None
         self.pattern_print_active = False
-        self.pending_pattern_print_points: list[tuple[int, float, float]] | None = None
+        self.pending_pattern_print_points: list[
+            tuple[int, float, float, float]
+        ] | None = None
         self.pattern_print_dot_states: dict[int, str] = {}
         self.pattern_print_command_events: list[tuple[str, int] | None] = []
         self.pattern_print_total_dots = 0
@@ -3664,8 +3667,8 @@ class MainWindow(QMainWindow):
     def pattern_bbox_data(self) -> dict[str, float]:
         if not self.pattern_points:
             return {"x_min": 0.0, "x_max": 0.0, "y_min": 0.0, "y_max": 0.0}
-        xs = [x for x, _y in self.pattern_points]
-        ys = [y for _x, y in self.pattern_points]
+        xs = [point[0] for point in self.pattern_points]
+        ys = [point[1] for point in self.pattern_points]
         return {
             "x_min": min(xs),
             "x_max": max(xs),
@@ -3797,7 +3800,7 @@ class MainWindow(QMainWindow):
             return float(point[0]), float(point[1])
         raise ValueError("expected x/y pair")
 
-    def parse_pattern_file(self, path: Path) -> list[tuple[float, float]]:
+    def parse_pattern_file(self, path: Path) -> list[PatternPoint]:
         if path.suffix.lower() == ".json":
             with path.open("r", encoding="utf-8") as file:
                 data = json.load(file)
@@ -3806,7 +3809,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("pattern JSON must contain a points list")
             return self.parse_pattern_points(raw_points)
 
-        points: list[tuple[float, float]] = []
+        points: list[PatternPoint] = []
         with path.open("r", encoding="utf-8") as file:
             for line_number, line in enumerate(file, start=1):
                 text = line.strip()
@@ -3814,32 +3817,40 @@ class MainWindow(QMainWindow):
                     continue
                 parts = [part.strip() for part in text.split(",")]
                 if len(parts) < 2:
-                    raise ValueError(f"line {line_number}: expected x,y")
+                    raise ValueError(f"line {line_number}: expected x,y[,z]")
                 if line_number == 1 and parts[0].lower() in {"x", "pcs_x"}:
                     continue
                 try:
-                    point = (float(parts[0]), float(parts[1]))
+                    point = (
+                        float(parts[0]),
+                        float(parts[1]),
+                        float(parts[2]) if len(parts) >= 3 else 0.0,
+                    )
                 except ValueError as exc:
                     raise ValueError(f"line {line_number}: invalid number") from exc
+                if not all(math.isfinite(value) for value in point):
+                    raise ValueError(f"line {line_number}: non-finite value")
                 points.append(point)
         if not points:
             raise ValueError("pattern contains no points")
         return points
 
-    def parse_pattern_points(self, raw_points) -> list[tuple[float, float]]:
-        points: list[tuple[float, float]] = []
+    def parse_pattern_points(self, raw_points) -> list[PatternPoint]:
+        points: list[PatternPoint] = []
         for index, point in enumerate(raw_points, start=1):
             if isinstance(point, dict):
                 x = float(point["x"])
                 y = float(point["y"])
+                z = float(point.get("z", point.get("z_offset", 0.0)))
             elif isinstance(point, list) and len(point) >= 2:
                 x = float(point[0])
                 y = float(point[1])
+                z = float(point[2]) if len(point) >= 3 else 0.0
             else:
                 raise ValueError(f"pattern point {index} is invalid")
-            if not math.isfinite(x) or not math.isfinite(y):
+            if not all(math.isfinite(value) for value in (x, y, z)):
                 raise ValueError(f"pattern point {index} contains non-finite values")
-            points.append((x, y))
+            points.append((x, y, z))
         if not points:
             raise ValueError("pattern contains no points")
         return points
@@ -3890,12 +3901,18 @@ class MainWindow(QMainWindow):
             self.update_pattern_alignment_reference_display()
             return
 
-        xs = [x for x, _y in self.pattern_points]
-        ys = [y for _x, y in self.pattern_points]
-        self.pattern_stats_label.setText(
+        xs = [point[0] for point in self.pattern_points]
+        ys = [point[1] for point in self.pattern_points]
+        z_offsets = [point[2] for point in self.pattern_points]
+        stats_text = (
             f"{len(self.pattern_points)} pts, "
             f"bbox {max(xs) - min(xs):.3f} x {max(ys) - min(ys):.3f} mm"
         )
+        if min(z_offsets) != 0.0 or max(z_offsets) != 0.0:
+            stats_text += (
+                f", Z offset {min(z_offsets):.3f}..{max(z_offsets):.3f} mm"
+            )
+        self.pattern_stats_label.setText(stats_text)
         self.pattern_transform_label.setText(self.pattern_transform_text())
         self.stage_view.set_pattern_points(self.transformed_pattern_points())
         self.update_pattern_alignment_reference_display()
@@ -3919,6 +3936,14 @@ class MainWindow(QMainWindow):
     def transformed_pattern_points(self) -> list[tuple[int, float, float]]:
         return [
             (index, *self.pattern_point_to_stage(point))
+            for index, point in enumerate(self.pattern_points)
+        ]
+
+    def transformed_pattern_print_points(
+        self,
+    ) -> list[tuple[int, float, float, float]]:
+        return [
+            (index, *self.pattern_point_to_stage(point), point[2])
             for index, point in enumerate(self.pattern_points)
         ]
 
@@ -4022,8 +4047,8 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def pattern_point_to_stage(self, point: tuple[float, float]) -> tuple[float, float]:
-        x, y = point
+    def pattern_point_to_stage(self, point: tuple[float, ...]) -> tuple[float, float]:
+        x, y = point[0], point[1]
         stage_x = (
             self.pattern_work_offset_x
             + self.pattern_transform_a11 * x
@@ -4129,9 +4154,9 @@ class MainWindow(QMainWindow):
 
     def set_pattern_transform_from_points(
         self,
-        first_point: tuple[float, float],
+        first_point: tuple[float, ...],
         first_stage: tuple[float, float],
-        second_point: tuple[float, float] | None = None,
+        second_point: tuple[float, ...] | None = None,
         second_stage: tuple[float, float] | None = None,
     ) -> None:
         measurements = [
@@ -4309,9 +4334,9 @@ class MainWindow(QMainWindow):
         )
 
     def rotate_flipped_pattern_point(
-        self, point: tuple[float, float]
+        self, point: tuple[float, ...]
     ) -> tuple[float, float]:
-        x, y = point
+        x, y = point[0], point[1]
         return (
             self.pattern_transform_a11 * x + self.pattern_transform_a12 * y,
             self.pattern_transform_a21 * x + self.pattern_transform_a22 * y,
@@ -4950,8 +4975,8 @@ class MainWindow(QMainWindow):
                 (0.0, 10.0),
             ]
             return (defaults + fallback[len(defaults):])[:required]
-        xs = [x for x, _y in self.pattern_points]
-        ys = [y for _x, y in self.pattern_points]
+        xs = [point[0] for point in self.pattern_points]
+        ys = [point[1] for point in self.pattern_points]
         x_min = min(xs)
         x_max = max(xs)
         y_min = min(ys)
@@ -5164,7 +5189,7 @@ class MainWindow(QMainWindow):
             for nominal_x, nominal_y, _stage_x, _stage_y
             in self.pattern_alignment_measurements
         ]
-        reference_points.append(point)
+        reference_points.append((point[0], point[1]))
         if not self.validate_nominal_alignment_points(reference_points):
             QMessageBox.warning(
                 self,
@@ -5332,7 +5357,7 @@ class MainWindow(QMainWindow):
 
     def add_pattern_alignment_measurement(
         self,
-        nominal_point: tuple[float, float],
+        nominal_point: tuple[float, ...],
         stage_position: tuple[float, float],
     ) -> bool:
         previous_measurements = list(self.pattern_alignment_measurements)
@@ -5504,7 +5529,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        points = self.transformed_pattern_points()
+        points = self.transformed_pattern_print_points()
         if not points:
             self.append_log("! pattern has no print points")
             return
@@ -5575,7 +5600,7 @@ class MainWindow(QMainWindow):
         self.update_control_states()
 
     def build_pattern_dot_print_commands(
-        self, points: list[tuple[int, float, float]]
+        self, points: list[tuple[int, float, float, float]]
     ) -> tuple[list[str], list[tuple[str, int] | None]]:
         print_height = self.pattern_print_height_spin.value()
         travel_height = self.pattern_travel_height_spin.value()
@@ -5586,12 +5611,12 @@ class MainWindow(QMainWindow):
         commands: list[str] = ["V102"]
         events: list[tuple[str, int] | None] = [None]
         dot_count = 0
-        for point_index, x, y in points:
+        for point_index, x, y, z_offset in points:
             if not (0.0 <= x <= STAGE_X_MAX_MM and 0.0 <= y <= STAGE_Y_MAX_MM):
                 self.append_log(f"! skipped off-stage pattern point X{x:.3f} Y{y:.3f}")
                 continue
             dot_count += 1
-            z = self.interpolate_height(x, y)
+            z = self.interpolate_height(x, y) + z_offset
             commands.append(f"V1 X{x:.6f} Y{y:.6f}")
             events.append(None)
             commands.append(f"V102 Z{travel_height:g}")
