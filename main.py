@@ -109,6 +109,7 @@ CIRCLE_PRINT_SEGMENT_MM = 1.0
 SERIAL_COMMAND_INTERVAL_S = 0.01
 DEFAULT_STAY_ALIVE_POLL_SECONDS = 60
 DEFAULT_MAX_TRAVEL_SPEED_MM_S = 0.0
+DEFAULT_HEIGHT_MAP_PROBE_R = 0.1
 STAY_ALIVE_PAYLOAD = "M400"
 MAXIMUM_Z_RETURN_MARGIN_MM = 0.5
 DEFAULT_HEIGHT_MAP_MAX_DEVIATION_WARNING_MM = 0.5
@@ -155,6 +156,7 @@ class OptionsDialog(QDialog):
         auto_margin_enabled: bool,
         auto_margin_mm: float,
         height_map_max_deviation_mm: float,
+        height_map_probe_r: float,
         use_four_point_alignment: bool,
         max_travel_speed_mm_s: float,
         parent=None,
@@ -167,6 +169,7 @@ class OptionsDialog(QDialog):
         self.auto_margin_check = QCheckBox("Enable")
         self.auto_margin_spin = QDoubleSpinBox()
         self.height_map_deviation_spin = QDoubleSpinBox()
+        self.height_map_probe_r_spin = QDoubleSpinBox()
         self.four_point_alignment_check = QCheckBox("Use 4-point alignment")
         self.max_travel_speed_spin = QDoubleSpinBox()
 
@@ -175,6 +178,7 @@ class OptionsDialog(QDialog):
             auto_margin_enabled,
             auto_margin_mm,
             height_map_max_deviation_mm,
+            height_map_probe_r,
             use_four_point_alignment,
             max_travel_speed_mm_s,
         )
@@ -185,6 +189,7 @@ class OptionsDialog(QDialog):
         auto_margin_enabled: bool,
         auto_margin_mm: float,
         height_map_max_deviation_mm: float,
+        height_map_probe_r: float,
         use_four_point_alignment: bool,
         max_travel_speed_mm_s: float,
     ) -> None:
@@ -226,6 +231,12 @@ class OptionsDialog(QDialog):
         self.height_map_deviation_spin.setSuffix(" mm")
         form.addRow("Height map warning deviation", self.height_map_deviation_spin)
 
+        self.height_map_probe_r_spin.setRange(0.001, 10.0)
+        self.height_map_probe_r_spin.setDecimals(3)
+        self.height_map_probe_r_spin.setValue(height_map_probe_r)
+        self.height_map_probe_r_spin.setPrefix("R")
+        form.addRow("Height map probe R", self.height_map_probe_r_spin)
+
         self.four_point_alignment_check.setChecked(use_four_point_alignment)
         form.addRow("", self.four_point_alignment_check)
 
@@ -252,6 +263,9 @@ class OptionsDialog(QDialog):
 
     def height_map_max_deviation_mm(self) -> float:
         return self.height_map_deviation_spin.value()
+
+    def height_map_probe_r(self) -> float:
+        return self.height_map_probe_r_spin.value()
 
     def use_four_point_alignment(self) -> bool:
         return self.four_point_alignment_check.isChecked()
@@ -1924,6 +1938,7 @@ class MainWindow(QMainWindow):
         self.height_map_max_deviation_warning_mm = (
             DEFAULT_HEIGHT_MAP_MAX_DEVIATION_WARNING_MM
         )
+        self.height_map_probe_r = DEFAULT_HEIGHT_MAP_PROBE_R
         self.port_refreshing = False
         self.camera_config: dict[str, object] = {}
         self.camera_exposure_compensation = 0.0
@@ -2030,6 +2045,7 @@ class MainWindow(QMainWindow):
             self.auto_height_map_margin_enabled,
             self.auto_height_map_margin_mm,
             self.height_map_max_deviation_warning_mm,
+            self.height_map_probe_r,
             self.use_four_point_alignment,
             self.max_travel_speed_mm_s,
             self,
@@ -2043,6 +2059,7 @@ class MainWindow(QMainWindow):
         self.height_map_max_deviation_warning_mm = (
             dialog.height_map_max_deviation_mm()
         )
+        self.height_map_probe_r = dialog.height_map_probe_r()
         self.use_four_point_alignment = dialog.use_four_point_alignment()
         self.max_travel_speed_mm_s = dialog.max_travel_speed_mm_s()
         self.apply_stay_alive_poll_interval()
@@ -2699,6 +2716,12 @@ class MainWindow(QMainWindow):
                     0.0,
                     100.0,
                 )
+            probe_r_value = data.get("height_map_probe_r")
+            if probe_r_value is not None:
+                value = float(probe_r_value)
+                if not math.isfinite(value):
+                    raise ValueError("height_map_probe_r must be finite")
+                self.height_map_probe_r = clamp(value, 0.001, 10.0)
             if "use_four_point_alignment" in data:
                 self.use_four_point_alignment = bool(
                     data["use_four_point_alignment"]
@@ -2725,6 +2748,7 @@ class MainWindow(QMainWindow):
             "height_map_max_deviation_warning_mm": (
                 self.height_map_max_deviation_warning_mm
             ),
+            "height_map_probe_r": self.height_map_probe_r,
             "use_four_point_alignment": self.use_four_point_alignment,
             "max_travel_speed_mm_s": self.max_travel_speed_mm_s,
         }
@@ -6236,6 +6260,9 @@ class MainWindow(QMainWindow):
         ]
         return [(point_x, point_y) for point_y in ys for point_x in xs]
 
+    def height_map_probe_option(self) -> str:
+        return f"R{self.height_map_probe_r:g}"
+
     def queue_next_height_map_point(self) -> None:
         if not self.height_map_active:
             return
@@ -6251,7 +6278,11 @@ class MainWindow(QMainWindow):
         x, y = self.height_map_plan[self.height_map_index]
         point_number = self.height_map_index + 1
         point_id = f"heightmap_{point_number}"
-        probe_option = "R1" if self.height_map_index == 0 else "R0.1"
+        probe_option = (
+            "R1"
+            if self.height_map_index == 0
+            else self.height_map_probe_option()
+        )
         self.height_map_probe_phase = (
             "coarse" if self.height_map_index == 0 else "fine"
         )
@@ -6280,7 +6311,10 @@ class MainWindow(QMainWindow):
             self.height_map_status_label.setText(
                 f"Fine {self.height_map_index}/{len(self.height_map_plan)}"
             )
-            self.send_payload("V4 R0.1 Iheightmap_1", force=True)
+            self.send_payload(
+                f"V4 {self.height_map_probe_option()} Iheightmap_1",
+                force=True,
+            )
             return
 
         self.height_map_waiting_for_probe = False
