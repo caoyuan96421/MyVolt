@@ -6278,18 +6278,11 @@ class MainWindow(QMainWindow):
         x, y = self.height_map_plan[self.height_map_index]
         point_number = self.height_map_index + 1
         point_id = f"heightmap_{point_number}"
-        probe_option = (
-            "R1"
-            if self.height_map_index == 0
-            else self.height_map_probe_option()
-        )
-        self.height_map_probe_phase = (
-            "coarse" if self.height_map_index == 0 else "fine"
-        )
+        probe_option = self.height_map_probe_option()
+        self.height_map_probe_phase = "probe"
         self.height_map_waiting_for_probe = True
         self.height_map_status_label.setText(
-            f"{self.height_map_probe_phase.title()} "
-            f"{self.height_map_index}/{len(self.height_map_plan)}"
+            f"Probing {self.height_map_index}/{len(self.height_map_plan)}"
         )
         self.send_payload(f"V1 X{x:.6f} Y{y:.6f}", force=True)
         self.send_payload("M400", force=True)
@@ -6297,24 +6290,6 @@ class MainWindow(QMainWindow):
 
     def record_height_map_probe(self, probe) -> None:
         if not self.height_map_active or not self.height_map_waiting_for_probe:
-            return
-
-        if self.height_map_probe_phase == "coarse":
-            self.append_log(
-                "# height map coarse point 1: "
-                f"X{probe.x:.4f} Y{probe.y:.4f} Z{probe.z:.6f}"
-            )
-            if self.height_map_abort_requested:
-                self.finish_height_map_sequence()
-                return
-            self.height_map_probe_phase = "fine"
-            self.height_map_status_label.setText(
-                f"Fine {self.height_map_index}/{len(self.height_map_plan)}"
-            )
-            self.send_payload(
-                f"V4 {self.height_map_probe_option()} Iheightmap_1",
-                force=True,
-            )
             return
 
         self.height_map_waiting_for_probe = False
